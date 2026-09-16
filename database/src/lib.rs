@@ -1,3 +1,4 @@
+extern crate ahash;
 extern crate basichll;
 extern crate config;
 #[macro_use(log)]
@@ -7,16 +8,25 @@ extern crate parser;
 extern crate persistence;
 extern crate rand;
 extern crate rdbutil;
-extern crate rehashinghashmap;
 extern crate response;
+extern crate serde_json;
 extern crate skiplist;
 extern crate util;
 
+pub mod acl;
+pub mod bloom;
 pub mod dbutil;
 pub mod error;
+pub mod geo;
+pub mod hash;
+pub mod json;
 pub mod list;
+pub mod search;
+pub mod shard;
 pub mod set;
+pub mod stream;
 pub mod string;
+pub mod timeseries;
 pub mod zset;
 
 use std::collections::Bound;
@@ -29,26 +39,36 @@ use std::ops::RangeFull;
 use std::path::Path;
 use std::sync::mpsc::Sender;
 
+use ahash::RandomState;
 use config::Config;
 use crc64::crc64;
 use logger::{Level, Logger};
 use parser::ParsedCommand;
 use persistence::aof::Aof;
-use rehashinghashmap::RehashingHashMap;
 use response::Response;
 use util::{get_random_hex_chars, glob_match, mstime};
 
+/// A HashMap using ahash for faster hashing (Dragonfly-inspired optimization)
+type FastMap<K, V> = HashMap<K, V, RandomState>;
+
+use acl::Acl;
 use error::OperationError;
 use list::ValueList;
+use bloom::{BloomFilter, CuckooFilter, TDigest, TopK};
+use hash::ValueHash;
+use json::ValueJson;
 use rdbutil::encode_u64_to_slice_u8;
+use search::SearchEngine;
 use set::ValueSet;
+use timeseries::TimeSeries;
+use stream::ValueStream;
 use string::ValueString;
 use zset::ValueSortedSet;
 
 const ACTIVE_EXPIRE_CYCLE_LOOKUPS_PER_LOOP: usize = 20;
 
 /// Any value storable in the database
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Debug, Clone)]
 pub enum Value {
     /// Nil should not be stored, but it is used as a default for initialized values
     Nil,
@@ -56,6 +76,20 @@ pub enum Value {
     List(ValueList),
     Set(ValueSet),
     SortedSet(ValueSortedSet),
+    Hash(ValueHash),
+    Stream(ValueStream),
+    /// Bloom filter (BF.*)
+    BloomFilter(BloomFilter),
+    /// Cuckoo filter (CF.*)
+    CuckooFilter(CuckooFilter),
+    /// t-digest (TDIGEST.*)
+    TDigest(TDigest),
+    /// Top-K (TOPK.*)
+    TopK(TopK),
+    /// JSON document (JSON.*)
+    Json(ValueJson),
+    /// Time series (TS.*)
+    TimeSeries(TimeSeries),
 }
 
 /// Events relevant for clients in pubsub mode
@@ -71,6 +105,12 @@ pub enum PubsubEvent {
     PatternUnsubscription(Vec<u8>, usize),
     /// A message was received, it may have matched a pattern and it was sent in a channel.
     Message(Vec<u8>, Option<Vec<u8>>, Vec<u8>),
+    /// Sharded subscription (SSUBSCRIBE)
+    ShardedSubscription(Vec<u8>, usize),
+    /// Sharded unsubscription (SUNSUBSCRIBE)
+    ShardedUnsubscription(Vec<u8>, usize),
+    /// Sharded message (from SPUBLISH)
+    ShardedMessage(Vec<u8>, Vec<u8>),
 }
 
 impl PubsubEvent {
@@ -109,6 +149,21 @@ impl PubsubEvent {
                 Response::Data(b"punsubscribe".to_vec()),
                 Response::Data(pattern.clone()),
                 Response::Integer(*subscriptions as i64),
+            ]),
+            PubsubEvent::ShardedSubscription(channel, subscriptions) => Response::Array(vec![
+                Response::Data(b"ssubscribe".to_vec()),
+                Response::Data(channel.clone()),
+                Response::Integer(*subscriptions as i64),
+            ]),
+            PubsubEvent::ShardedUnsubscription(channel, subscriptions) => Response::Array(vec![
+                Response::Data(b"sunsubscribe".to_vec()),
+                Response::Data(channel.clone()),
+                Response::Integer(*subscriptions as i64),
+            ]),
+            PubsubEvent::ShardedMessage(channel, message) => Response::Array(vec![
+                Response::Data(b"smessage".to_vec()),
+                Response::Data(channel.clone()),
+                Response::Data(message.clone()),
             ]),
         }
     }
@@ -219,6 +274,14 @@ impl Value {
         }
     }
 
+    /// Returns true if the value is a hash.
+    pub fn is_hash(&self) -> bool {
+        match self {
+            Value::Hash(_) => true,
+            _ => false,
+        }
+    }
+
     /// Sets the value to a string.
     ///
     /// # Examples
@@ -242,9 +305,9 @@ impl Value {
     /// use database::Value;
     ///
     /// let mut val = Value::Nil;
-    /// assert_eq!(val.get().unwrap(), vec![]);
+    /// assert_eq!(val.get().unwrap(), Vec::<u8>::new());
     /// val.set(vec![1, 245, 3]).unwrap();
-    /// assert_eq!(val.get().unwrap(), vec![1, 245, 3]);
+    /// assert_eq!(val.get().unwrap(), vec![1u8, 245, 3]);
     /// ```
     ///
     /// ```
@@ -753,6 +816,33 @@ impl Value {
         }
     }
 
+    /// LPOS: Find the index(es) of matching elements in a list.
+    pub fn lpos(&self, element: &[u8], rank: i64, count: usize, maxlen: usize) -> Result<Vec<i64>, OperationError> {
+        match self {
+            Value::Nil => Ok(Vec::new()),
+            Value::List(value) => Ok(value.lpos(element, rank, count, maxlen)),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
+    /// Pop from this list and push to another list. Used by LMOVE/BLMOVE.
+    pub fn pop_push(&mut self, src_right: bool, dst: &mut Value, dst_right: bool) -> Result<Option<Vec<u8>>, OperationError> {
+        match self {
+            Value::List(src_list) => {
+                // Ensure dst is a list (or nil -> create)
+                if dst.is_nil() {
+                    *dst = Value::List(ValueList::new());
+                }
+                match dst {
+                    Value::List(dst_list) => Ok(src_list.pop_push(src_right, dst_list, dst_right)),
+                    _ => Err(OperationError::WrongTypeError),
+                }
+            }
+            Value::Nil => Ok(None),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
     /// Adds an element to a set.
     /// Returns true if the element was inserted or false if was already in the set.
     /// `set_max_intset_entries` is the maximum number of elements a set can
@@ -1193,6 +1283,43 @@ impl Value {
         }
     }
 
+    /// Returns `count` random members from a sorted set.
+    /// When `allow_duplicates` is true, the same member can be returned multiple times.
+    pub fn zrandmember(&self, count: usize, allow_duplicates: bool) -> Result<Vec<Vec<u8>>, OperationError> {
+        match self {
+            Value::Nil => Ok(vec![]),
+            Value::SortedSet(value) => {
+                let card = value.zcard();
+                if card == 0 { return Ok(vec![]); }
+                let members = value.zrange(0, (card - 1) as i64, false, false);
+                let mut result = Vec::new();
+                if allow_duplicates {
+                    use rand::Rng;
+                    let mut rng = rand::thread_rng();
+                    for _ in 0..count {
+                        let idx = rng.gen_range(0..members.len());
+                        result.push(members[idx].clone());
+                    }
+                } else {
+                    let take = count.min(members.len());
+                    // Fisher-Yates partial shuffle
+                    let mut indices: Vec<usize> = (0..members.len()).collect();
+                    use rand::Rng;
+                    let mut rng = rand::thread_rng();
+                    for i in 0..take {
+                        let j = rng.gen_range(i..indices.len());
+                        indices.swap(i, j);
+                    }
+                    for i in 0..take {
+                        result.push(members[indices[i]].clone());
+                    }
+                }
+                Ok(result)
+            }
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
     /// Increments the score of an element. It creates the element if it was not
     /// already in the sorted set. Returns the new score.
     ///
@@ -1608,6 +1735,160 @@ impl Value {
         Ok(Value::SortedSet(value))
     }
 
+    /// Sets a field in a hash. Returns true if the field is new.
+    pub fn hset(&mut self, field: Vec<u8>, value: Vec<u8>) -> Result<bool, OperationError> {
+        match self {
+            Value::Nil => {
+                let mut hash = ValueHash::new();
+                let is_new = hash.hset(field, value);
+                *self = Value::Hash(hash);
+                Ok(is_new)
+            }
+            Value::Hash(hash) => Ok(hash.hset(field, value)),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
+    /// Sets a field in a hash only if it doesn't exist. Returns true if set.
+    pub fn hsetnx(&mut self, field: Vec<u8>, value: Vec<u8>) -> Result<bool, OperationError> {
+        match self {
+            Value::Nil => {
+                let mut hash = ValueHash::new();
+                let is_new = hash.hsetnx(field, value);
+                *self = Value::Hash(hash);
+                Ok(is_new)
+            }
+            Value::Hash(hash) => Ok(hash.hsetnx(field, value)),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
+    /// Gets the value of a hash field.
+    pub fn hget(&self, field: &[u8]) -> Result<Option<Vec<u8>>, OperationError> {
+        match self {
+            Value::Nil => Ok(None),
+            Value::Hash(hash) => Ok(hash.hget(field).cloned()),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
+    /// Gets the values of multiple hash fields.
+    pub fn hmget(&self, fields: &[Vec<u8>]) -> Result<Vec<Option<Vec<u8>>>, OperationError> {
+        match self {
+            Value::Nil => Ok(fields.iter().map(|_| None).collect()),
+            Value::Hash(hash) => Ok(hash.hmget(fields).into_iter().map(|v| v.cloned()).collect()),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
+    /// Sets multiple field-value pairs in a hash.
+    pub fn hmset(&mut self, field_values: Vec<(Vec<u8>, Vec<u8>)>) -> Result<(), OperationError> {
+        match self {
+            Value::Nil => {
+                let mut hash = ValueHash::new();
+                hash.hmset(field_values);
+                *self = Value::Hash(hash);
+                Ok(())
+            }
+            Value::Hash(hash) => {
+                hash.hmset(field_values);
+                Ok(())
+            }
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
+    /// Deletes one or more hash fields. Returns the number of fields removed.
+    pub fn hdel(&mut self, fields: &[Vec<u8>]) -> Result<usize, OperationError> {
+        match self {
+            Value::Nil => Ok(0),
+            Value::Hash(hash) => Ok(hash.hdel(fields)),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
+    /// Returns the number of fields in a hash.
+    pub fn hlen(&self) -> Result<usize, OperationError> {
+        match self {
+            Value::Nil => Ok(0),
+            Value::Hash(hash) => Ok(hash.hlen()),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
+    /// Returns the string length of the value associated with the field.
+    pub fn hstrlen(&self, field: &[u8]) -> Result<usize, OperationError> {
+        match self {
+            Value::Nil => Ok(0),
+            Value::Hash(hash) => Ok(hash.hstrlen(field)),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
+    /// Checks if a hash field exists.
+    pub fn hexists(&self, field: &[u8]) -> Result<bool, OperationError> {
+        match self {
+            Value::Nil => Ok(false),
+            Value::Hash(hash) => Ok(hash.hexists(field)),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
+    /// Returns all field names in a hash.
+    pub fn hkeys(&self) -> Result<Vec<Vec<u8>>, OperationError> {
+        match self {
+            Value::Nil => Ok(vec![]),
+            Value::Hash(hash) => Ok(hash.hkeys()),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
+    /// Returns all values in a hash.
+    pub fn hvals(&self) -> Result<Vec<Vec<u8>>, OperationError> {
+        match self {
+            Value::Nil => Ok(vec![]),
+            Value::Hash(hash) => Ok(hash.hvals()),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
+    /// Returns all field-value pairs in a hash.
+    pub fn hgetall(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, OperationError> {
+        match self {
+            Value::Nil => Ok(vec![]),
+            Value::Hash(hash) => Ok(hash.hgetall()),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
+    /// Increments the integer value of a hash field.
+    pub fn hincrby(&mut self, field: Vec<u8>, increment: i64) -> Result<i64, OperationError> {
+        match self {
+            Value::Nil => {
+                let mut hash = ValueHash::new();
+                let r = hash.hincrby(field, increment)?;
+                *self = Value::Hash(hash);
+                Ok(r)
+            }
+            Value::Hash(hash) => hash.hincrby(field, increment),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
+    /// Increments the float value of a hash field.
+    pub fn hincrbyfloat(&mut self, field: Vec<u8>, increment: f64) -> Result<f64, OperationError> {
+        match self {
+            Value::Nil => {
+                let mut hash = ValueHash::new();
+                let r = hash.hincrbyfloat(field, increment)?;
+                *self = Value::Hash(hash);
+                Ok(r)
+            }
+            Value::Hash(hash) => hash.hincrbyfloat(field, increment),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
     /// Serializes and writes into `writer` the object current value.
     /// The serialized version also includes the type, the version and a crc.
     ///
@@ -1629,6 +1910,14 @@ impl Value {
             Value::List(l) => l.dump(&mut data)?,
             Value::Set(s) => s.dump(&mut data)?,
             Value::SortedSet(s) => s.dump(&mut data)?,
+            Value::Hash(h) => h.dump(&mut data)?,
+            Value::Stream(_) => return Err(OperationError::ValueError("ERR DUMP not supported for Stream".to_owned())),
+            Value::BloomFilter(_) => return Err(OperationError::ValueError("ERR DUMP not supported for BloomFilter".to_owned())),
+            Value::CuckooFilter(_) => return Err(OperationError::ValueError("ERR DUMP not supported for CuckooFilter".to_owned())),
+            Value::TDigest(_) => return Err(OperationError::ValueError("ERR DUMP not supported for TDigest".to_owned())),
+            Value::TopK(_) => return Err(OperationError::ValueError("ERR DUMP not supported for TopK".to_owned())),
+            Value::Json(_) => return Err(OperationError::ValueError("ERR DUMP not supported for Json".to_owned())),
+            Value::TimeSeries(_) => return Err(OperationError::ValueError("ERR DUMP not supported for TimeSeries".to_owned())),
         };
         let crc = crc64(0, &*data);
         encode_u64_to_slice_u8(crc, &mut data).unwrap();
@@ -1644,6 +1933,14 @@ impl Value {
             Value::List(l) => l.debug_object(),
             Value::Set(s) => s.debug_object(),
             Value::SortedSet(s) => s.debug_object(),
+            Value::Hash(h) => h.debug_object(),
+            Value::Stream(s) => format!("Stream length:{}", s.xlen()),
+            Value::BloomFilter(bf) => format!("BloomFilter size:{} capacity:{}", bf.size, bf.capacity),
+            Value::CuckooFilter(cf) => format!("CuckooFilter size:{} buckets:{}", cf.size, cf.num_buckets),
+            Value::TDigest(td) => format!("TDigest count:{}", td.count()),
+            Value::TopK(tk) => format!("TopK k:{}", tk.info().k),
+            Value::Json(j) => format!("Json type:{}", j.json_type()),
+            Value::TimeSeries(ts) => format!("TimeSeries samples:{} retention:{}", ts.samples.len(), ts.retention_ms),
         }
     }
 
@@ -1654,6 +1951,372 @@ impl Value {
             Value::List(l) => l.llen() == 0,
             Value::Set(s) => s.scard() == 0,
             Value::SortedSet(s) => s.zcard() == 0,
+            Value::Hash(h) => h.hlen() == 0,
+            Value::Stream(s) => s.xlen() == 0,
+            Value::BloomFilter(bf) => bf.size == 0,
+            Value::CuckooFilter(cf) => cf.size == 0,
+            Value::TDigest(td) => td.count() == 0,
+            Value::TopK(tk) => tk.list().is_empty(),
+            Value::Json(j) => j.value.is_null(),
+            Value::TimeSeries(ts) => ts.samples.is_empty(),
+        }
+    }
+
+    // --- Bloom filter methods ---
+
+    pub fn set_bloom_filter(&mut self, bf: BloomFilter) {
+        *self = Value::BloomFilter(bf);
+    }
+
+    pub fn ensure_bloom_filter(&mut self, capacity: usize, error_rate: f64) -> Result<&mut BloomFilter, OperationError> {
+        match self {
+            Value::Nil => {
+                *self = Value::BloomFilter(BloomFilter::new(capacity, error_rate));
+                match self {
+                    Value::BloomFilter(bf) => Ok(bf),
+                    _ => unreachable!(),
+                }
+            }
+            Value::BloomFilter(bf) => Ok(bf),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
+    pub fn bloom_exists(&self, item: &[u8]) -> Result<bool, OperationError> {
+        match self {
+            Value::BloomFilter(bf) => Ok(bf.exists(item)),
+            Value::Nil => Ok(false),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
+    pub fn bloom_info(&self) -> Result<bloom::BloomFilterInfo, OperationError> {
+        match self {
+            Value::BloomFilter(bf) => Ok(bf.info()),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
+    // --- Cuckoo filter methods ---
+
+    pub fn set_cuckoo_filter(&mut self, cf: CuckooFilter) {
+        *self = Value::CuckooFilter(cf);
+    }
+
+    pub fn ensure_cuckoo_filter(&mut self, capacity: usize) -> Result<&mut CuckooFilter, OperationError> {
+        match self {
+            Value::Nil => {
+                *self = Value::CuckooFilter(CuckooFilter::new(capacity));
+                match self {
+                    Value::CuckooFilter(cf) => Ok(cf),
+                    _ => unreachable!(),
+                }
+            }
+            Value::CuckooFilter(cf) => Ok(cf),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
+    pub fn cuckoo_exists(&self, item: &[u8]) -> Result<bool, OperationError> {
+        match self {
+            Value::CuckooFilter(cf) => Ok(cf.exists(item)),
+            Value::Nil => Ok(false),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
+    pub fn cuckoo_count(&self, item: &[u8]) -> Result<usize, OperationError> {
+        match self {
+            Value::CuckooFilter(cf) => Ok(cf.count(item)),
+            Value::Nil => Ok(0),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
+    pub fn cuckoo_delete(&mut self, item: &[u8]) -> Result<bool, OperationError> {
+        match self {
+            Value::CuckooFilter(cf) => Ok(cf.delete(item)),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
+    pub fn cuckoo_info(&self) -> Result<bloom::CuckooFilterInfo, OperationError> {
+        match self {
+            Value::CuckooFilter(cf) => Ok(cf.info()),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
+    // --- TDigest methods ---
+
+    pub fn set_tdigest(&mut self, td: TDigest) {
+        *self = Value::TDigest(td);
+    }
+
+    pub fn ensure_tdigest(&mut self, compression: f64) -> Result<&mut TDigest, OperationError> {
+        match self {
+            Value::Nil => {
+                *self = Value::TDigest(TDigest::new(compression));
+                match self {
+                    Value::TDigest(td) => Ok(td),
+                    _ => unreachable!(),
+                }
+            }
+            Value::TDigest(td) => Ok(td),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
+    pub fn tdigest_reset(&mut self) -> Result<(), OperationError> {
+        match self {
+            Value::TDigest(td) => { td.reset(); Ok(()) }
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
+    pub fn tdigest_quantile(&self, q: f64) -> Result<f64, OperationError> {
+        match self {
+            Value::TDigest(td) => Ok(td.quantile(q)),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
+    pub fn tdigest_cdf(&self, v: f64) -> Result<f64, OperationError> {
+        match self {
+            Value::TDigest(td) => Ok(td.cdf(v)),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
+    pub fn tdigest_min(&self) -> Result<f64, OperationError> {
+        match self {
+            Value::TDigest(td) => Ok(td.min()),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
+    pub fn tdigest_max(&self) -> Result<f64, OperationError> {
+        match self {
+            Value::TDigest(td) => Ok(td.max()),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
+    pub fn tdigest_info(&self) -> Result<(u64, f64), OperationError> {
+        match self {
+            Value::TDigest(td) => Ok((td.count(), 100.0)),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
+    pub fn tdigest_ref(&self) -> Result<&TDigest, OperationError> {
+        match self {
+            Value::TDigest(td) => Ok(td),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
+    pub fn tdigest_rank(&self, v: f64) -> Result<i64, OperationError> {
+        match self {
+            Value::TDigest(td) => Ok(td.rank(v)),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
+    pub fn tdigest_revrank(&self, v: f64) -> Result<i64, OperationError> {
+        match self {
+            Value::TDigest(td) => Ok(td.revrank(v)),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
+    pub fn tdigest_byrank(&self, r: f64) -> Result<f64, OperationError> {
+        match self {
+            Value::TDigest(td) => Ok(td.value_at_rank(r)),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
+    pub fn tdigest_byrevrank(&self, r: f64) -> Result<f64, OperationError> {
+        match self {
+            Value::TDigest(td) => Ok(td.value_at_revrank(r)),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
+    pub fn tdigest_trimmed_mean(&self, low: f64, high: f64) -> Result<f64, OperationError> {
+        match self {
+            Value::TDigest(td) => Ok(td.trimmed_mean(low, high)),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
+    // --- TopK methods ---
+
+    pub fn set_topk(&mut self, tk: TopK) {
+        *self = Value::TopK(tk);
+    }
+
+    pub fn ensure_topk(&mut self, k: usize, width: usize, depth: usize) -> Result<&mut TopK, OperationError> {
+        match self {
+            Value::Nil => {
+                *self = Value::TopK(TopK::new(k, width, depth));
+                match self {
+                    Value::TopK(tk) => Ok(tk),
+                    _ => unreachable!(),
+                }
+            }
+            Value::TopK(tk) => Ok(tk),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
+    pub fn topk_query(&self, item: &[u8]) -> Result<bool, OperationError> {
+        match self {
+            Value::TopK(tk) => Ok(tk.query(item)),
+            Value::Nil => Ok(false),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
+    pub fn topk_count(&self, item: &[u8]) -> Result<u64, OperationError> {
+        match self {
+            Value::TopK(tk) => Ok(tk.count(item)),
+            Value::Nil => Ok(0),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
+    pub fn topk_list(&self) -> Result<Vec<(Vec<u8>, u64)>, OperationError> {
+        match self {
+            Value::TopK(tk) => Ok(tk.list()),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
+    pub fn topk_info(&self) -> Result<bloom::TopKInfo, OperationError> {
+        match self {
+            Value::TopK(tk) => Ok(tk.info()),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
+    // --- JSON methods ---
+
+    pub fn set_json(&mut self, j: ValueJson) {
+        *self = Value::Json(j);
+    }
+
+    pub fn json_ref(&self) -> Result<&ValueJson, OperationError> {
+        match self {
+            Value::Json(j) => Ok(j),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
+    pub fn json_mut(&mut self) -> Result<&mut ValueJson, OperationError> {
+        match self {
+            Value::Json(j) => Ok(j),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
+    // --- TimeSeries methods ---
+
+    pub fn set_timeseries(&mut self, ts: TimeSeries) {
+        *self = Value::TimeSeries(ts);
+    }
+
+    pub fn ensure_timeseries(&mut self, retention_ms: i64, labels: Vec<(String, String)>, policy: timeseries::DuplicatePolicy) -> Result<&mut TimeSeries, OperationError> {
+        match self {
+            Value::Nil => {
+                *self = Value::TimeSeries(TimeSeries::new(retention_ms, labels, policy));
+                match self {
+                    Value::TimeSeries(ts) => Ok(ts),
+                    _ => unreachable!(),
+                }
+            }
+            Value::TimeSeries(ts) => Ok(ts),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
+    pub fn ts_add(&mut self, timestamp: i64, value: f64) -> Result<i64, OperationError> {
+        match self {
+            Value::TimeSeries(ts) => ts.add(timestamp, value).map_err(|e| OperationError::ValueError(e)),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
+    pub fn ts_get(&self) -> Result<Option<timeseries::Sample>, OperationError> {
+        match self {
+            Value::TimeSeries(ts) => Ok(ts.get()),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
+    pub fn ts_range(&self, from: i64, to: i64, count: Option<usize>) -> Result<Vec<timeseries::Sample>, OperationError> {
+        match self {
+            Value::TimeSeries(ts) => Ok(ts.range(from, to, count)),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
+    pub fn ts_revrange(&self, from: i64, to: i64, count: Option<usize>) -> Result<Vec<timeseries::Sample>, OperationError> {
+        match self {
+            Value::TimeSeries(ts) => Ok(ts.revrange(from, to, count)),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
+    pub fn ts_del(&mut self, from: i64, to: i64) -> Result<usize, OperationError> {
+        match self {
+            Value::TimeSeries(ts) => Ok(ts.del(from, to)),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
+    pub fn ts_info(&self) -> Result<String, OperationError> {
+        match self {
+            Value::TimeSeries(ts) => {
+                let info = ts.info();
+                let mut result = String::new();
+                result.push_str(&format!("totalSamples:{}\n", info.total_samples));
+                result.push_str(&format!("memoryUsage:{}\n", info.chunk_size));
+                result.push_str(&format!("retentionTime:{}\n", info.retention_ms));
+                result.push_str(&format!("chunkCount:{}\n", info.chunk_count));
+                result.push_str(&format!("chunkSize:{}\n", info.chunk_size));
+                result.push_str(&format!("duplicatePolicy:{}\n", info.duplicate_policy));
+                result.push_str(&format!("minTimestamp:{}\n", info.min_timestamp));
+                result.push_str(&format!("maxTimestamp:{}\n", info.max_timestamp));
+                result.push_str(&format!("encoding:{}\n", info.encoding));
+                result.push_str(&format!("labels:", ));
+                if info.labels.is_empty() {
+                    result.push_str("\n");
+                } else {
+                    for (i, (k, v)) in info.labels.iter().enumerate() {
+                        if i > 0 { result.push(','); }
+                        result.push_str(&format!("{}={}", k, v));
+                    }
+                    result.push('\n');
+                }
+                Ok(result)
+            }
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
+    pub fn ts_ref(&self) -> Result<&TimeSeries, OperationError> {
+        match self {
+            Value::TimeSeries(ts) => Ok(ts),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
+    pub fn ts_mut(&mut self) -> Result<&mut TimeSeries, OperationError> {
+        match self {
+            Value::TimeSeries(ts) => Ok(ts),
+            _ => Err(OperationError::WrongTypeError),
         }
     }
 }
@@ -1663,10 +2326,10 @@ type SenderMap<T> = HashMap<usize, Sender<T>>;
 pub struct Database {
     pub config: Config,
 
-    data: Vec<RehashingHashMap<Vec<u8>, Value>>,
+    data: Vec<FastMap<Vec<u8>, Value>>,
 
     /// Maps a key to an expiration time. Expiration time is in milliseconds.
-    data_expiration_ms: Vec<RehashingHashMap<Vec<u8>, i64>>,
+    data_expiration_ms: Vec<FastMap<Vec<u8>, i64>>,
     /// Maps a key to a collection of client identifiers.
     /// Every time a key is modified, the watched key client is flushed.
     /// The clients who are subscribed to a key should check whether their id
@@ -1678,10 +2341,15 @@ pub struct Database {
     /// Maps a pattern to a list of pubsub events listeners.
     /// The `usize` key is used as a client identifier.
     pattern_subscribers: HashMap<Vec<u8>, SenderMap<Option<Response>>>,
+    /// Sharded pub/sub subscribers (SSUBSCRIBE/SPUBLISH).
+    /// These are stored per-shard, keyed by channel name.
+    sharded_subscribers: HashMap<Vec<u8>, SenderMap<Option<Response>>>,
+    /// ACL (Access Control List) for user management and permissions.
+    pub acl: Acl,
     /// Maps a pattern to a list of key listeners. When a key is modified a message
     /// with `true` is published.
     /// The `usize` key is used as a client identifier.
-    key_subscribers: Vec<RehashingHashMap<Vec<u8>, SenderMap<bool>>>,
+    key_subscribers: Vec<FastMap<Vec<u8>, SenderMap<bool>>>,
     /// A unique identifier counter to assign to clients
     subscriber_id: usize,
     /// Which database to try to run the active expire cycle next
@@ -1702,10 +2370,26 @@ pub struct Database {
     pub aof: Option<Aof>,
     /// Is it loading data from a file
     pub loading: bool,
+    /// Cached Lua scripts: SHA1 hex -> source code.
+    pub script_cache: HashMap<String, String>,
+    /// Stored Lua functions: name -> {code, engine, description}.
+    pub lua_functions: HashMap<String, LuaFunctionInfo>,
+    /// Full-text search engine (RediSearch).
+    pub search: SearchEngine,
+}
+
+/// Information about a stored Lua function.
+#[derive(Debug, Clone)]
+pub struct LuaFunctionInfo {
+    pub name: String,
+    pub code: String,
+    pub engine: String,
+    pub description: String,
+    pub flags: Vec<String>,
 }
 
 pub struct Iter<'a> {
-    inner: rehashinghashmap::Iter<'a, Vec<u8>, Value>,
+    inner: std::collections::hash_map::Iter<'a, Vec<u8>, Value>,
 }
 
 impl<'a> Iterator for Iter<'a> {
@@ -1726,8 +2410,8 @@ macro_rules! random_key {
         let dict = &$dict;
         let len = dict.len();
         let pos = rand::random::<usize>() % len;
-        // FIXME: remove clone
-        dict.keys().skip(pos).take(1).next().unwrap().clone()
+        // Use nth() for direct index access, still requires clone for owned key
+        dict.keys().nth(pos).unwrap().clone()
     }};
 }
 
@@ -1746,9 +2430,9 @@ impl Database {
         let mut key_subscribers = Vec::with_capacity(size);
         let mut watched_keys = Vec::with_capacity(size);
         for _ in 0..size {
-            data.push(RehashingHashMap::new());
-            data_expiration_ms.push(RehashingHashMap::new());
-            key_subscribers.push(RehashingHashMap::new());
+            data.push(FastMap::default());
+            data_expiration_ms.push(FastMap::default());
+            key_subscribers.push(FastMap::default());
             watched_keys.push(HashMap::new());
         }
         let aof = if config.appendonly {
@@ -1763,6 +2447,8 @@ impl Database {
             data_expiration_ms,
             subscribers: HashMap::new(),
             pattern_subscribers: HashMap::new(),
+            sharded_subscribers: HashMap::new(),
+            acl: Acl::new(),
             key_subscribers,
             subscriber_id: 0,
             watched_keys,
@@ -1776,11 +2462,54 @@ impl Database {
             start_mstime: mstime(),
             aof,
             loading: false,
+            script_cache: HashMap::new(),
+            lua_functions: HashMap::new(),
+            search: SearchEngine::new(),
         }
     }
 
     pub fn uptime(&self) -> i64 {
         mstime() - self.start_mstime
+    }
+
+    /// Creates a new Database instance suitable for use as a shard.
+    /// Unlike `new()`, this doesn't change the working directory or create
+    /// an AOF file. Each shard only uses database index 0.
+    pub fn new_shard(_config: &Config) -> Self {
+        let mut data = Vec::with_capacity(1);
+        let mut data_expiration_ms = Vec::with_capacity(1);
+        let mut key_subscribers = Vec::with_capacity(1);
+        let mut watched_keys = Vec::with_capacity(1);
+        data.push(FastMap::default());
+        data_expiration_ms.push(FastMap::default());
+        key_subscribers.push(FastMap::default());
+        watched_keys.push(HashMap::new());
+
+        Database {
+            config: Config::default(0, Logger::new(Level::Warning)),
+            data,
+            data_expiration_ms,
+            subscribers: HashMap::new(),
+            pattern_subscribers: HashMap::new(),
+            sharded_subscribers: HashMap::new(),
+            acl: Acl::new(),
+            key_subscribers,
+            subscriber_id: 0,
+            watched_keys,
+            active_expire_cycle_db: 0,
+            monitor_senders: Vec::new(),
+            version: "0.0.1",
+            rustc_version: "",
+            git_sha1: "00000000",
+            git_dirty: true,
+            run_id: get_random_hex_chars(40),
+            start_mstime: mstime(),
+            aof: None,
+            loading: false,
+            script_cache: HashMap::new(),
+            lua_functions: HashMap::new(),
+            search: SearchEngine::new(),
+        }
     }
 
     fn is_expired(&self, index: usize, key: &[u8]) -> bool {
@@ -2006,11 +2735,8 @@ impl Database {
     /// Publishes a `true` to all key listeners.
     /// If the value is now empty, it is removed.
     pub fn key_updated(&mut self, index: usize, key: &[u8]) {
-        if self.config.active_rehashing {
-            self.data[index].rehash();
-            self.data_expiration_ms[index].rehash();
-            self.key_subscribers[index].rehash();
-        }
+        // Note: standard HashMap handles rehashing automatically,
+        // no manual rehash() needed (unlike RehashingHashMap).
 
         let is_empty = match self.data[index].get(key) {
             Some(v) => v.is_empty(),
@@ -2244,6 +2970,104 @@ impl Database {
         responses
     }
 
+    /// Returns a random key from the database, or None if the database is empty.
+    pub fn randomkey(&self, dbindex: usize) -> Option<Vec<u8>> {
+        let len = self.data[dbindex].len();
+        if len == 0 {
+            return None;
+        }
+        let pos = rand::random::<usize>() % len;
+        self.data[dbindex]
+            .keys()
+            .skip(pos)
+            .take(1)
+            .next()
+            .cloned()
+    }
+
+    /// Returns all keys in a database as a Vec of references.
+    pub fn data_keys(&self, dbindex: usize) -> Vec<&Vec<u8>> {
+        self.data[dbindex].keys().collect()
+    }
+
+    /// Returns a list of active pubsub channels.
+    /// If pattern is provided, only channels matching the pattern are returned.
+    pub fn pubsub_channels(&self, pattern: Option<&[u8]>) -> Vec<Vec<u8>> {
+        self.subscribers
+            .keys()
+            .filter(|ch| {
+                match pattern {
+                    Some(p) => glob_match(p, ch, false),
+                    None => true,
+                }
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Returns the number of subscribers for each specified channel.
+    pub fn pubsub_numsub(&self, channels: &[Vec<u8>]) -> Vec<(Vec<u8>, usize)> {
+        channels
+            .iter()
+            .map(|ch| {
+                let count = self.subscribers.get(ch.as_slice()).map_or(0, |s| s.len());
+                (ch.clone(), count)
+            })
+            .collect()
+    }
+
+    /// Returns the total number of pattern subscriptions.
+    pub fn pubsub_numpat(&self) -> usize {
+        self.pattern_subscribers.len()
+    }
+
+    // --- Sharded Pub/Sub methods ---
+
+    /// Subscribes a Sender to a sharded channel. Returns a subscriber_id.
+    pub fn ssubscribe(&mut self, channel: Vec<u8>, sender: Sender<Option<Response>>) -> usize {
+        if !self.sharded_subscribers.contains_key(&channel) {
+            self.sharded_subscribers.insert(channel.clone(), HashMap::new());
+        }
+        let subs = self.sharded_subscribers.get_mut(&channel).unwrap();
+        let subscriber_id = self.subscriber_id;
+        subs.insert(subscriber_id, sender);
+        self.subscriber_id += 1;
+        subscriber_id
+    }
+
+    /// Unsubscribes a Sender from a sharded channel.
+    pub fn sunsubscribe(&mut self, channel: Vec<u8>, subscriber_id: usize) -> bool {
+        if !self.sharded_subscribers.contains_key(&channel) {
+            return false;
+        }
+        let subs = self.sharded_subscribers.get_mut(&channel).unwrap();
+        subs.remove(&subscriber_id).is_some()
+    }
+
+    /// Publishes a message to a sharded channel. Returns the number of recipients.
+    pub fn spublish(&self, channel_name: &[u8], message: &[u8]) -> usize {
+        let mut c = 0;
+        if let Some(subs) = self.sharded_subscribers.get(channel_name) {
+            for sender in subs.values() {
+                if sender
+                    .send(Some(
+                        PubsubEvent::ShardedMessage(channel_name.to_vec(), message.to_vec())
+                            .as_response(),
+                    ))
+                    .is_ok()
+                {
+                    c += 1;
+                }
+            }
+        }
+        c
+    }
+
+    /// Returns the number of sharded subscribers for a channel.
+    pub fn spublish_numsub(&self, channel: &[u8]) -> usize {
+        self.sharded_subscribers.get(channel).map_or(0, |s| s.len())
+    }
+
     /// Tries to remove items that are already expired.
     pub fn active_expire_cycle(&mut self, duration_ms: i64) {
         let num_dbs = self.data.len();
@@ -2340,6 +3164,7 @@ mod test_command {
     use list::ValueList;
     use logger::{Level, Logger};
     use set::ValueSet;
+    use stream::ValueStream;
     use string::ValueString;
     use zset;
     use zset::ValueSortedSet;

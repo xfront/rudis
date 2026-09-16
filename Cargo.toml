@@ -1,5 +1,5 @@
 [package]
-name = "rsedis"
+name = "rudis"
 version = "0.0.1"
 authors = [ "Sebastian Waisbrot <seppo0010@gmail.com>" ]
 exclude = [
@@ -12,7 +12,7 @@ edition = "2018"
 
 [[bin]]
 
-name = "rsedis"
+name = "rudis"
 doc = false
 
 [dependencies.config]

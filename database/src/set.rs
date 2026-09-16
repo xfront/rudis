@@ -8,7 +8,7 @@ use rdbutil::constants::*;
 use rdbutil::{encode_len, encode_slice_u8, EncodeError};
 use rdbutil::{encode_u16_to_slice_u8, encode_u32_to_slice_u8, encode_u64_to_slice_u8};
 
-use rand::distributions::{IndependentSample, Range, Sample};
+use rand::Rng;
 use rand::thread_rng;
 
 #[derive(PartialEq, Debug, Clone)]
@@ -122,12 +122,11 @@ impl ValueSet {
 
     fn get_random_positions(&self, len: usize, count: usize, allow_duplicates: bool) -> Vec<usize> {
         // TODO: turn this into an iterator
-        let mut range = Range::new(0, len);
         let mut rng = thread_rng();
         if allow_duplicates {
             let mut r = Vec::new();
             for _ in 0..count {
-                r.push(range.ind_sample(&mut rng));
+                r.push(rng.gen_range(0..len));
             }
             r.sort_by(|a, b| a.cmp(b).reverse());
             r
@@ -135,7 +134,7 @@ impl ValueSet {
             let min = if len < count { len } else { count };
             let mut r = HashSet::new();
             while r.len() < min {
-                r.insert(range.sample(&mut rng));
+                r.insert(rng.gen_range(0..len));
             }
             let mut vec = r.iter().cloned().collect::<Vec<_>>();
             vec.sort_by(|a, b| a.cmp(b).reverse());

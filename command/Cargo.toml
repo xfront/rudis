@@ -5,7 +5,10 @@ authors = ["Sebastian Waisbrot <seppo0010@gmail.com>"]
 edition = "2018"
 
 [dependencies]
-bitflags = "1.2"
+bitflags = "2"
+rand = "0.8"
+mlua = { version = "0.9", features = ["lua54", "vendored"] }
+serde_json = "1.0"
 compat = { path = "../compat" }
 config = { path = "../config" }
 database = { path = "../database" }

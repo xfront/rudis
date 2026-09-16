@@ -39,7 +39,7 @@ array set ::redis::callback {}
 array set ::redis::state {} ;# State in non-blocking reply reading
 array set ::redis::statestack {} ;# Stack of states, for nested mbulks
 
-proc redis {{server 127.0.0.1} {port 6379} {defer 0}} {
+proc redis {{server 127.0.0.1} {port 63799} {defer 0}} {
     set fd [socket $server $port]
     fconfigure $fd -translation binary
     set id [incr ::redis::id]

@@ -26,12 +26,9 @@ path = "../database"
 path = "../command"
 
 [dependencies]
-net2 = { version = "0.2.2", features = ["nightly"] }
+bytes = "1"
+libc = "0.2"
+socket2 = "0.5"
 
-[target.x86_64-unknown-linux-gnu.dependencies]
-fork = "0.1"
-unix_socket = "0.4.3"
-
-[target.x86_64-apple-darwin.dependencies]
-fork = "0.1"
-unix_socket = "0.4.3"
+[dependencies.persistence]
+path = "../persistence"

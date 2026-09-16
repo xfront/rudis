@@ -7,20 +7,21 @@ use std::{
     sync::mpsc::{channel, Receiver, Sender},
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc, Mutex, MutexGuard,
+        Arc,
     },
     thread,
     time::Duration,
 };
 
-use net2::{TcpBuilder, TcpStreamExt};
+use bytes::BytesMut;
+use socket2::{Domain, Protocol, SockAddr, Socket, TcpKeepalive, Type};
 #[cfg(unix)]
 use std::{fs::File, path::Path};
 #[cfg(unix)]
-use unix_socket::{UnixListener, UnixStream};
+use std::os::unix::net::{UnixListener, UnixStream};
 
 use config::Config;
-use database::Database;
+use database::shard::{Shard, ShardedDatabase};
 use logger::Level;
 use parser::{OwnedParsedCommand, ParseError, Parser};
 use response::{Response, ResponseError};
@@ -37,9 +38,11 @@ enum Stream {
     Tcp(TcpStream),
 }
 
+/// Common Stream operations, implemented once per platform.
+/// The TCP-specific logic (keepalive, etc.) is shared;
+/// Unix-specific paths are no-ops where appropriate.
 #[cfg(unix)]
 impl Stream {
-    /// Creates a new independently owned handle to the underlying socket.
     fn try_clone(&self) -> io::Result<Stream> {
         match self {
             Stream::Tcp(s) => Ok(Stream::Tcp(s.try_clone()?)),
@@ -47,39 +50,32 @@ impl Stream {
         }
     }
 
-    /// Write a buffer into this object, returning how many bytes were written.
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        match self {
-            Stream::Tcp(s) => s.write(buf),
-            Stream::Unix(s) => s.write(buf),
-        }
-    }
-
-    /// Sets the keepalive timeout to the timeout specified.
-    /// It fails silently for UNIX sockets.
     fn set_keepalive(&self, duration: Option<Duration>) -> io::Result<()> {
         match self {
-            Stream::Tcp(s) => TcpStreamExt::set_keepalive(s, duration),
+            Stream::Tcp(s) => {
+                let socket = Socket::from(s.try_clone()?);
+                let keepalive = TcpKeepalive::new();
+                let keepalive = match duration {
+                    Some(dur) => keepalive.with_time(dur),
+                    None => keepalive,
+                };
+                socket.set_tcp_keepalive(&keepalive)
+            }
+            // UNIX sockets don't support TCP keepalive
             Stream::Unix(_) => Ok(()),
         }
     }
 
-    /// Sets the write timeout to the timeout specified.
-    /// It fails silently for UNIX sockets.
     fn set_write_timeout(&self, dur: Option<Duration>) -> io::Result<()> {
         match self {
             Stream::Tcp(s) => s.set_write_timeout(dur),
-            // TODO: couldn't figure out how to enable this in unix_socket
             Stream::Unix(_) => Ok(()),
         }
     }
 
-    /// Sets the read timeout to the timeout specified.
-    /// It fails silently for UNIX sockets.
     fn set_read_timeout(&self, dur: Option<Duration>) -> io::Result<()> {
         match self {
             Stream::Tcp(s) => s.set_read_timeout(dur),
-            // TODO: couldn't figure out how to enable this in unix_socket
             Stream::Unix(_) => Ok(()),
         }
     }
@@ -87,8 +83,6 @@ impl Stream {
 
 #[cfg(unix)]
 impl Read for Stream {
-    /// Pull some bytes from this source into the specified buffer,
-    /// returning how many bytes were read.
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
             Stream::Tcp(s) => s.read(buf),
@@ -97,40 +91,51 @@ impl Read for Stream {
     }
 }
 
+#[cfg(unix)]
+impl Write for Stream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Stream::Tcp(s) => s.write(buf),
+            Stream::Unix(s) => s.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Stream::Tcp(s) => s.flush(),
+            Stream::Unix(s) => s.flush(),
+        }
+    }
+}
+
 #[cfg(not(unix))]
 impl Stream {
-    /// Creates a new independently owned handle to the underlying socket.
     fn try_clone(&self) -> io::Result<Stream> {
         match self {
             Stream::Tcp(s) => Ok(Stream::Tcp(s.try_clone()?)),
         }
     }
 
-    /// Write a buffer into this object, returning how many bytes were written.
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        match self {
-            Stream::Tcp(s) => s.write(buf),
-        }
-    }
-
-    /// Sets the keepalive timeout to the timeout specified.
-    /// It fails silently for UNIX sockets.
     fn set_keepalive(&self, duration: Option<Duration>) -> io::Result<()> {
         match self {
-            Stream::Tcp(s) => TcpStreamExt::set_keepalive(s, duration),
+            Stream::Tcp(s) => {
+                let socket = Socket::from(s.try_clone()?);
+                let keepalive = TcpKeepalive::new();
+                let keepalive = match duration {
+                    Some(dur) => keepalive.with_time(dur),
+                    None => keepalive,
+                };
+                socket.set_tcp_keepalive(&keepalive)
+            }
         }
     }
 
-    /// Sets the write timeout to the timeout specified.
-    /// It fails silently for UNIX sockets.
     fn set_write_timeout(&self, dur: Option<Duration>) -> io::Result<()> {
         match self {
             Stream::Tcp(s) => s.set_write_timeout(dur),
         }
     }
 
-    /// Sets the read timeout to the timeout specified.
-    /// It fails silently for UNIX sockets.
     fn set_read_timeout(&self, dur: Option<Duration>) -> io::Result<()> {
         match self {
             Stream::Tcp(s) => s.set_read_timeout(dur),
@@ -140,11 +145,24 @@ impl Stream {
 
 #[cfg(not(unix))]
 impl Read for Stream {
-    /// Pull some bytes from this source into the specified buffer,
-    /// returning how many bytes were read.
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
             Stream::Tcp(s) => s.read(buf),
+        }
+    }
+}
+
+#[cfg(not(unix))]
+impl Write for Stream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Stream::Tcp(s) => s.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Stream::Tcp(s) => s.flush(),
         }
     }
 }
@@ -153,16 +171,18 @@ impl Read for Stream {
 struct Client {
     /// The socket connection
     stream: Stream,
-    /// A reference to the database
-    db: Arc<Mutex<Database>>,
+    /// A reference to the sharded database
+    db: Arc<ShardedDatabase>,
     /// The client unique identifier
     id: usize,
 }
 
 /// The database server
 pub struct Server {
-    /// A reference to the database
-    db: Arc<Mutex<Database>>,
+    /// A reference to the sharded database
+    db: Arc<ShardedDatabase>,
+    /// Server configuration
+    config: Config,
     /// A list of channels listening for incoming connections
     listener_channels: Vec<Sender<u8>>,
     /// A list of threads listening for incoming connections
@@ -175,7 +195,7 @@ pub struct Server {
 
 impl Client {
     /// Creates a new TCP socket client
-    pub fn tcp(stream: TcpStream, db: Arc<Mutex<Database>>, id: usize) -> Client {
+    pub fn tcp(stream: TcpStream, db: Arc<ShardedDatabase>, id: usize) -> Client {
         Client {
             stream: Stream::Tcp(stream),
             db,
@@ -185,7 +205,7 @@ impl Client {
 
     /// Creates a new UNIX socket client
     #[cfg(unix)]
-    pub fn unix(stream: UnixStream, db: Arc<Mutex<Database>>, id: usize) -> Client {
+    pub fn unix(stream: UnixStream, db: Arc<ShardedDatabase>, id: usize) -> Client {
         Client {
             stream: Stream::Unix(stream),
             db,
@@ -193,7 +213,9 @@ impl Client {
         }
     }
 
-    /// Creates a thread that writes into the client stream each response received
+    /// Creates a thread that writes into the client stream each response received.
+    /// Uses BytesMut for zero-copy serialization and batches multiple pending
+    /// responses into a single write() syscall (Dragonfly-inspired optimization).
     fn create_writer_thread(
         &self,
         sender: Sender<(Level, String)>,
@@ -201,15 +223,58 @@ impl Client {
     ) {
         let mut stream = self.stream.try_clone().unwrap();
         thread::spawn(move || {
+            // Reusable buffer to avoid per-response allocations
+            let mut buf = BytesMut::with_capacity(512);
             while let Ok(Some(msg)) = rx.recv() {
-                match stream.write(&*msg.as_bytes()) {
-                    Ok(_) => (),
+                // Serialize the first response
+                msg.write_to(&mut buf);
+
+                // Batch: drain any additional pending responses without blocking
+                while let Ok(Some(msg)) = rx.try_recv() {
+                    msg.write_to(&mut buf);
+                }
+
+                // Single write syscall for all batched responses
+                match stream.write_all(&buf) {
+                    Ok(_) => {
+                        let _ = stream.flush();
+                    }
                     Err(e) => {
-                        sendlog!(sender, Warning, "Error writing to client: {:?}", e).unwrap()
+                        let _ = sendlog!(sender, Warning, "Error writing to client: {:?}", e);
                     }
                 }
+                buf.clear();
             }
         });
+    }
+
+    /// Determines the shard index for a parsed command.
+    /// Routes by the first key argument for data commands,
+    /// and uses shard 0 for pubsub/admin commands.
+    fn shard_for_command(parsed: &parser::ParsedCommand, num_shards: usize) -> usize {
+        if num_shards <= 1 {
+            return 0;
+        }
+        // Pubsub and admin commands go to shard 0 for consistency
+        if let Ok(cmd) = parsed.get_str(0) {
+            match cmd {
+                "subscribe" | "unsubscribe" | "publish" | "psubscribe" | "punsubscribe"
+                | "ssubscribe" | "sunsubscribe" | "spublish"
+                | "pubsub" | "monitor" | "info" | "config" | "command" | "slowlog"
+                | "client" | "cluster" | "latency" | "slaveof" | "replconf" | "wait"
+                | "sync" | "psync" | "asking" | "readonly" | "readwrite" | "debug"
+                | "flushall" | "save" | "bgsave" | "bgrewriteaof" | "shutdown"
+                | "lastsave" | "role" | "select" | "auth" | "ping" | "echo" | "quit"
+                | "time" | "reset" | "acl" | "function" | "fcall" | "fcall_ro" => return 0,
+                _ => {}
+            }
+        }
+        // Route by first key (argument 1)
+        if let Ok(key) = parsed.get_vec(1) {
+            database::shard::ShardedDatabase::shard_for_key(&key) % num_shards
+        } else {
+            0
+        }
     }
 
     /// Runs all clients commands. The function loops until the client
@@ -287,13 +352,16 @@ impl Client {
             };
 
             let r = {
-                let mut db = match self.db.lock() {
-                    Ok(db) => db,
+                // Dragonfly-inspired: route to the correct shard based on the first key
+                let num_shards = self.db.num_shards();
+                let shard_idx = Self::shard_for_command(&parsed_command, num_shards);
+                let mut shard = match self.db.shard_write(0, shard_idx) {
+                    Ok(shard) => shard,
                     Err(_) => break,
                 };
 
-                // execute the command
-                command::command(parsed_command, &mut *db, &mut client)
+                // execute the command on the shard's database
+                command::command(parsed_command, &mut shard.db, &mut client)
             };
 
             // check out the response
@@ -339,13 +407,17 @@ impl Client {
         }
 
         {
-            let mut db = match self.db.lock() {
-                Ok(db) => db,
+            // Pubsub state is on shard 0
+            let mut shard = match self.db.shard_write(0, 0) {
+                Ok(shard) => shard,
                 Err(_) => return,
             };
 
             for (channel_name, subscriber_id) in client.subscriptions.into_iter() {
-                db.unsubscribe(channel_name.clone(), subscriber_id);
+                shard.db.unsubscribe(channel_name.clone(), subscriber_id);
+            }
+            for (channel_name, subscriber_id) in client.sharded_subscriptions.into_iter() {
+                shard.db.sunsubscribe(channel_name.clone(), subscriber_id);
             }
         }
     }
@@ -410,9 +482,10 @@ macro_rules! handle_listener {
 impl Server {
     /// Creates a new server
     pub fn new(config: Config) -> Server {
-        let db = Database::new(config);
+        let sharded_db = ShardedDatabase::new(&config);
         Server {
-            db: Arc::new(Mutex::new(db)),
+            db: Arc::new(sharded_db),
+            config,
             listener_channels: Vec::new(),
             listener_threads: Vec::new(),
             next_id: Arc::new(AtomicUsize::default()),
@@ -420,31 +493,30 @@ impl Server {
         }
     }
 
-    pub fn get_mut_db(&self) -> MutexGuard<database::Database> {
-        self.db.lock().unwrap()
+    /// Gets mutable access to shard 0's database for initialization.
+    pub fn get_mut_db(&self) -> std::sync::MutexGuard<'_, Shard> {
+        self.db.shard_write(0, 0).unwrap()
     }
 
     /// Runs the server. If `config.daemonize` is true, it forks and exits.
     #[cfg(unix)]
     pub fn run(&mut self) {
-        let (daemonize, pidfile) = {
-            let db = self.db.lock().unwrap();
-            (db.config.daemonize, db.config.pidfile.clone())
-        };
+        let (daemonize, pidfile) = (self.config.daemonize, self.config.pidfile.clone());
         if daemonize {
-            if let fork::Fork::Child = fork::daemon(true, true).expect("Fork failed") {
+            if unsafe { libc::daemon(1, 1) } == 0 {
                 if let Ok(mut fp) = File::create(Path::new(&*pidfile)) {
                     match write!(fp, "{}", process::id()) {
                         Ok(_) => (),
                         Err(e) => {
-                            let db = self.db.lock().unwrap();
-                            log!(db.config.logger, Warning, "Error writing pid: {}", e);
+                            log!(self.config.logger, Warning, "Error writing pid: {}", e);
                         }
                     }
                 }
                 self.start();
                 self.join();
-            };
+            } else {
+                panic!("Fork failed");
+            }
         } else {
             self.start();
             self.join();
@@ -453,10 +525,7 @@ impl Server {
 
     #[cfg(not(unix))]
     pub fn run(&mut self) {
-        let daemonize = {
-            let db = self.db.lock().unwrap();
-            db.config.daemonize
-        };
+        let daemonize = self.config.daemonize;
         if daemonize {
             panic!("Cannot daemonize in non-unix");
         } else {
@@ -466,13 +535,13 @@ impl Server {
     }
 
     #[cfg(windows)]
-    fn reuse_address(&self, _: &TcpBuilder) -> io::Result<()> {
+    fn set_reuse_address(&self, _socket: &Socket) -> io::Result<()> {
         Ok(())
     }
 
     #[cfg(not(windows))]
-    fn reuse_address(&self, builder: &TcpBuilder) -> io::Result<()> {
-        builder.reuse_address(true)?;
+    fn set_reuse_address(&self, socket: &Socket) -> io::Result<()> {
+        socket.set_reuse_address(true)?;
         Ok(())
     }
 
@@ -493,18 +562,19 @@ impl Server {
     ) -> io::Result<()> {
         for addr in t.to_socket_addrs()? {
             let (tx, rx) = channel();
-            let builder = match addr {
-                SocketAddr::V4(_) => TcpBuilder::new_v4(),
-                SocketAddr::V6(_) => TcpBuilder::new_v6(),
-            }?;
-
-            self.reuse_address(&builder)?;
-            let listener = builder.bind(addr)?.listen(tcp_backlog)?;
+            let domain = match addr {
+                SocketAddr::V4(_) => Domain::IPV4,
+                SocketAddr::V6(_) => Domain::IPV6,
+            };
+            let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+            self.set_reuse_address(&socket)?;
+            socket.bind(&SockAddr::from(addr))?;
+            socket.listen(tcp_backlog)?;
+            let listener: std::net::TcpListener = socket.into();
             self.listener_channels.push(tx);
             {
-                let db = self.db.lock().unwrap();
                 let th = handle_listener!(
-                    db.config.logger,
+                    self.config.logger,
                     listener,
                     self,
                     rx,
@@ -520,30 +590,23 @@ impl Server {
 
     /// Starts threads listening to new connections.
     pub fn start(&mut self) {
-        let (tcp_keepalive, timeout, addresses, tcp_backlog) = {
-            let db = self.db.lock().unwrap();
-            (
-                db.config.tcp_keepalive,
-                db.config.timeout,
-                db.config.addresses(),
-                db.config.tcp_backlog,
-            )
-        };
+        let tcp_keepalive = self.config.tcp_keepalive;
+        let timeout = self.config.timeout;
+        let tcp_backlog = self.config.tcp_backlog;
+        let addresses = self.config.addresses();
         for (host, port) in addresses {
             match self.listen((&host[..], port), tcp_keepalive, timeout, tcp_backlog) {
                 Ok(_) => {
-                    let db = self.db.lock().unwrap();
                     log!(
-                        db.config.logger,
+                        self.config.logger,
                         Notice,
                         "The server is now ready to accept connections on port {}",
                         port
                     );
                 }
                 Err(err) => {
-                    let db = self.db.lock().unwrap();
                     log!(
-                        db.config.logger,
+                        self.config.logger,
                         Warning,
                         "Creating Server TCP listening socket {}:{}: {:?}",
                         host,
@@ -560,30 +623,41 @@ impl Server {
         {
             let (hz_stop_tx, hz_stop_rx) = channel();
             self.hz_stop = Some(hz_stop_tx);
-            let dblock = self.db.clone();
+            let hz = self.config.hz;
+            let db_ref = self.db.clone();
+            let num_shards = db_ref.num_shards();
             thread::spawn(move || {
+                let mut shard_cursor = 0usize;
                 while hz_stop_rx.try_recv().is_err() {
-                    let mut db = dblock.lock().unwrap();
-                    let hz = db.config.hz;
-                    db.active_expire_cycle(10);
-                    drop(db);
+                    // Run active expire cycle across all shards round-robin.
+                    // Each tick processes one shard; the cursor advances so all
+                    // shards get serviced within num_shards ticks.
+                    if let Ok(mut shard) = db_ref.shard_write(0, shard_cursor) {
+                        shard.db.active_expire_cycle(10);
+                    }
+                    shard_cursor = (shard_cursor + 1) % num_shards;
                     thread::sleep(Duration::from_millis(10000 / hz as u64));
                 }
             });
         }
 
-        let mut db = self.db.lock().unwrap();
-        if db.aof.is_some() {
-            command::aof::load(&mut *db);
+        // Load AOF if configured (on shard 0)
+        if self.config.appendonly {
+            if let Ok(mut shard) = self.db.shard_write(0, 0) {
+                // Initialize AOF for this shard
+                shard.db.aof = Some(persistence::aof::Aof::new(&*self.config.appendfilename).unwrap());
+                if shard.db.aof.is_some() {
+                    command::aof::load(&mut shard.db);
+                }
+            }
         }
     }
 
     #[cfg(unix)]
     fn handle_unixsocket(&mut self) {
-        let db = self.db.lock().unwrap();
-        if let Some(unixsocket) = &db.config.unixsocket {
-            let tcp_keepalive = db.config.tcp_keepalive;
-            let timeout = db.config.timeout;
+        if let Some(unixsocket) = &self.config.unixsocket {
+            let tcp_keepalive = self.config.tcp_keepalive;
+            let timeout = self.config.timeout;
 
             let (tx, rx) = channel();
             self.listener_channels.push(tx);
@@ -591,7 +665,7 @@ impl Server {
                 Ok(l) => l,
                 Err(err) => {
                     log!(
-                        db.config.logger,
+                        self.config.logger,
                         Warning,
                         "Creating Server Unix socket {}: {:?}",
                         unixsocket,
@@ -601,7 +675,7 @@ impl Server {
                 }
             };
             let th = handle_listener!(
-                db.config.logger,
+                self.config.logger,
                 listener,
                 self,
                 rx,
@@ -615,8 +689,7 @@ impl Server {
 
     #[cfg(not(unix))]
     fn handle_unixsocket(&mut self) {
-        let db = self.db.lock().unwrap();
-        if db.config.unixsocket.is_some() {
+        if self.config.unixsocket.is_some() {
             let _ = writeln!(
                 &mut std::io::stderr(),
                 "Ignoring unixsocket in non unix environment\n"
@@ -629,8 +702,7 @@ impl Server {
     pub fn stop(&mut self) {
         for sender in self.listener_channels.iter() {
             let _ = sender.send(0);
-            let db = self.db.lock().unwrap();
-            for (host, port) in db.config.addresses() {
+            for (host, port) in self.config.addresses() {
                 for addrs in (&host[..], port).to_socket_addrs().unwrap() {
                     let _ = TcpStream::connect(addrs);
                 }
@@ -649,6 +721,7 @@ mod test_networking {
     use std::io::{Read, Write};
     use std::net::TcpStream;
     use std::str::from_utf8;
+    use std::sync::atomic::Ordering;
     use std::thread;
 
     use config::Config;
@@ -737,10 +810,10 @@ mod test_networking {
         let addr = format!("127.0.0.1:{}", port);
         let _ = TcpStream::connect(&*addr);
         thread::sleep(Duration::from_millis(100));
-        assert_eq!(*server.next_id.lock().unwrap(), 1);
+        assert_eq!(server.next_id.load(Ordering::Relaxed), 1);
         let _ = TcpStream::connect(&*addr);
         thread::sleep(Duration::from_millis(100));
-        assert_eq!(*server.next_id.lock().unwrap(), 2);
+        assert_eq!(server.next_id.load(Ordering::Relaxed), 2);
         server.stop();
     }
 }

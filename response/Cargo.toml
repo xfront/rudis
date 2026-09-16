@@ -3,5 +3,9 @@ name = "response"
 version = "0.1.0"
 authors = ["Sebastian Waisbrot <seppo0010@gmail.com>"]
 
+[dependencies]
+bytes = "1"
+itoa = "1"
+
 [dependencies.parser]
 path = "../parser"

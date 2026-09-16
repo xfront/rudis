@@ -1,7 +1,7 @@
-# rsedis
+# rudis
 
-[![Build Status](https://travis-ci.org/seppo0010/rsedis.svg?branch=master)](https://travis-ci.org/seppo0010/rsedis)
-[![Build status](https://ci.appveyor.com/api/projects/status/m9qeoc83m18q4656?svg=true)](https://ci.appveyor.com/project/seppo0011/rsedis)
+[![Build Status](https://travis-ci.org/seppo0010/rudis.svg?branch=master)](https://travis-ci.org/seppo0010/rudis)
+[![Build status](https://ci.appveyor.com/api/projects/status/m9qeoc83m18q4656?svg=true)](https://ci.appveyor.com/project/seppo0011/rudis)
 
 Redis re-implemented in Rust.
 
@@ -11,10 +11,10 @@ To learn Rust.
 
 ## Use Cases
 
-rsedis does not rely on UNIX-specific features. Windows users can run it as a
+rudis does not rely on UNIX-specific features. Windows users can run it as a
 replacement of Redis.
 
-rsedis uses multiple threads which may be more useful in machines with multiple
+rudis uses multiple threads which may be more useful in machines with multiple
 cores.
 
 ## Prerequisites

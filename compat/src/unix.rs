@@ -1,8 +1,7 @@
-use libc::funcs::posix88::unistd;
 use utsname::uname;
 
 pub fn getpid() -> u32 {
-    unsafe { unistd::getpid() as u32 }
+    unsafe { libc::getpid() as u32 }
 }
 
 pub fn getos() -> (String, String, String) {

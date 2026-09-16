@@ -1,8 +1,10 @@
+extern crate bytes;
 extern crate parser;
 
 use std::fmt::{Debug, Error, Formatter};
 use std::sync::mpsc::Receiver;
 
+use bytes::BytesMut;
 use parser::OwnedParsedCommand;
 
 /// A command response to send to a client
@@ -43,32 +45,51 @@ impl Debug for ResponseError {
 
 impl Response {
     /// Serializes the response into an array of bytes using Redis protocol.
+    /// Uses BytesMut for efficient buffer building (Dragonfly-inspired optimization).
     pub fn as_bytes(&self) -> Vec<u8> {
+        let mut buf = BytesMut::with_capacity(64);
+        self.write_to(&mut buf);
+        buf.to_vec()
+    }
+
+    /// Writes the serialized response directly into a BytesMut buffer.
+    /// This avoids intermediate allocations compared to as_bytes().
+    pub fn write_to(&self, buf: &mut BytesMut) {
         match self {
-            Response::Nil => b"$-1\r\n".to_vec(),
-            Response::Data(d) => [
-                &b"$"[..],
-                &d.len().to_string().into_bytes()[..],
-                b"\r\n",
-                &d[..],
-                b"\r\n",
-            ]
-            .concat(),
-            Response::Integer(i) => [&b":"[..], &i.to_string().into_bytes()[..], b"\r\n"].concat(),
-            Response::Error(d) => [&b"-"[..], (*d).as_bytes(), b"\r\n"].concat(),
-            Response::Status(d) => [
-                &b"+"[..],
-                (*d).as_bytes(),
-                &"\r\n".to_owned().into_bytes()[..],
-            ]
-            .concat(),
-            Response::Array(a) => [
-                &b"*"[..],
-                &a.len().to_string().into_bytes()[..],
-                b"\r\n",
-                &(a.iter().map(|el| el.as_bytes()).collect::<Vec<_>>()[..].concat())[..],
-            ]
-            .concat(),
+            Response::Nil => buf.extend_from_slice(b"$-1\r\n"),
+            Response::Data(d) => {
+                buf.extend_from_slice(b"$");
+                let mut len_buf = itoa::Buffer::new();
+                buf.extend_from_slice(len_buf.format(d.len()).as_bytes());
+                buf.extend_from_slice(b"\r\n");
+                buf.extend_from_slice(d);
+                buf.extend_from_slice(b"\r\n");
+            }
+            Response::Integer(i) => {
+                buf.extend_from_slice(b":");
+                let mut len_buf = itoa::Buffer::new();
+                buf.extend_from_slice(len_buf.format(*i).as_bytes());
+                buf.extend_from_slice(b"\r\n");
+            }
+            Response::Error(d) => {
+                buf.extend_from_slice(b"-");
+                buf.extend_from_slice(d.as_bytes());
+                buf.extend_from_slice(b"\r\n");
+            }
+            Response::Status(d) => {
+                buf.extend_from_slice(b"+");
+                buf.extend_from_slice(d.as_bytes());
+                buf.extend_from_slice(b"\r\n");
+            }
+            Response::Array(a) => {
+                buf.extend_from_slice(b"*");
+                let mut len_buf = itoa::Buffer::new();
+                buf.extend_from_slice(len_buf.format(a.len()).as_bytes());
+                buf.extend_from_slice(b"\r\n");
+                for el in a {
+                    el.write_to(buf);
+                }
+            }
         }
     }
 

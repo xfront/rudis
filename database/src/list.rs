@@ -241,6 +241,62 @@ impl ValueList {
             encoding, serialized
         )
     }
+
+    /// LPOS: Find the index of the first (or nth) occurrence of an element.
+    /// `rank`: 0 = first match, 1 = second match (from left), -1 = first from right, etc.
+    /// `count`: max number of matches (0 = all)
+    /// `maxlen`: max elements to scan (0 = all)
+    /// Returns a Vec of matching indices.
+    pub fn lpos(&self, element: &[u8], rank: i64, count: usize, maxlen: usize) -> Vec<i64> {
+        let mut results = Vec::new();
+        match *self {
+            ValueList::Data(ref list) => {
+                let len = list.len();
+                let forward = rank >= 0;
+                let mut rank_counter = if forward { rank as usize } else { (-rank) as usize };
+                let mut scanned = 0usize;
+
+                if forward {
+                    for (i, item) in list.iter().enumerate() {
+                        if maxlen > 0 && scanned >= maxlen { break; }
+                        scanned += 1;
+                        if item.as_slice() == element {
+                            rank_counter -= 1;
+                            if rank_counter == 0 {
+                                results.push(i as i64);
+                                if count > 0 && results.len() >= count { break; }
+                                // Reset for next match with rank=1 semantics
+                                rank_counter = 1;
+                            }
+                        }
+                    }
+                } else {
+                    let items: Vec<_> = list.iter().collect();
+                    for idx in (0..len).rev() {
+                        if maxlen > 0 && scanned >= maxlen { break; }
+                        scanned += 1;
+                        if items[idx].as_slice() == element {
+                            rank_counter -= 1;
+                            if rank_counter == 0 {
+                                results.push(idx as i64);
+                                if count > 0 && results.len() >= count { break; }
+                                rank_counter = 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        results
+    }
+
+    /// Pop from left or right and push to another list's left or right.
+    /// Returns the moved element, or None if source is empty.
+    pub fn pop_push(&mut self, src_right: bool, dst: &mut ValueList, dst_right: bool) -> Option<Vec<u8>> {
+        let el = self.pop(src_right)?;
+        dst.push(el.clone(), dst_right);
+        Some(el)
+    }
 }
 
 #[cfg(test)]

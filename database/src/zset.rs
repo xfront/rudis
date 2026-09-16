@@ -22,7 +22,7 @@ pub enum Aggregate {
 /**
  * SortedSetMember is a wrapper around f64 to implement ordering and equality.
  * f64 does not implement those traits because comparing floats has problems
- * but in the context of rsedis this basic implementation should be enough.
+ * but in the context of rudis this basic implementation should be enough.
  **/
 #[derive(Debug, Clone)]
 pub struct SortedSetMember {
@@ -107,7 +107,7 @@ impl PartialOrd for SortedSetMember {
     }
 }
 
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Debug, Clone)]
 pub enum ValueSortedSet {
     // FIXME: Vec<u8> is repeated in memory
     Data(OrderedSkipList<SortedSetMember>, HashMap<Vec<u8>, f64>),
@@ -158,7 +158,7 @@ impl ValueSortedSet {
                     if score.is_nan() && !zero_on_nan {
                         return Err(OperationError::NotANumberError);
                     }
-                    skiplist.remove(&SortedSetMember::new(val, el.clone()));
+                    skiplist.remove_by_value(&SortedSetMember::new(val, el.clone()));
                 }
                 if score.is_nan() {
                     if zero_on_nan {
@@ -195,7 +195,7 @@ impl ValueSortedSet {
             ValueSortedSet::Data(skiplist, hmap) => {
                 let mut val = match hmap.get(&member) {
                     Some(val) => {
-                        skiplist.remove(&SortedSetMember::new(*val, member.clone()));
+                        skiplist.remove_by_value(&SortedSetMember::new(*val, member.clone()));
                         *val
                     }
                     None => 0.0,
@@ -247,7 +247,10 @@ impl ValueSortedSet {
             Bound::Unbounded => Bound::Unbounded,
         };
 
-        skiplist.range(m1, m2).collect::<Vec<_>>()
+        if f1 > f2 {
+            return vec![];
+        }
+        skiplist.range((m1, m2)).collect::<Vec<_>>()
     }
 
     pub fn zcount(&self, min: Bound<f64>, max: Bound<f64>) -> usize {
@@ -263,7 +266,7 @@ impl ValueSortedSet {
             return vec![];
         }
 
-        let f = skiplist.front().unwrap().get_f64();
+        let f = skiplist.first().unwrap().get_f64();
         let mut f1 = SortedSetMember::new(*f, vec![]);
         let mut f2 = SortedSetMember::new(*f, vec![]);
         let m1 = match min {
@@ -290,7 +293,10 @@ impl ValueSortedSet {
             Bound::Unbounded => Bound::Unbounded,
         };
 
-        skiplist.range(m1, m2).collect::<Vec<_>>()
+        if f1 > f2 {
+            return vec![];
+        }
+        skiplist.range((m1, m2)).collect::<Vec<_>>()
     }
 
     pub fn zlexcount(&self, min: Bound<Vec<u8>>, max: Bound<Vec<u8>>) -> usize {
@@ -305,7 +311,7 @@ impl ValueSortedSet {
             Some(val) => val,
             None => return false,
         };
-        skiplist.remove(&SortedSetMember::new(score, member));
+        skiplist.remove_by_value(&SortedSetMember::new(score, member));
         true
     }
 
@@ -321,7 +327,7 @@ impl ValueSortedSet {
         };
 
         for _ in 0..count {
-            let el = skiplist.remove_index(pos);
+            let el = skiplist.remove(pos);
             hmap.remove(&el.s);
         }
         count
@@ -339,7 +345,7 @@ impl ValueSortedSet {
         };
 
         for _ in 0..count {
-            let el = skiplist.remove_index(pos);
+            let el = skiplist.remove(pos);
             hmap.remove(&el.s);
         }
         count
@@ -411,7 +417,7 @@ impl ValueSortedSet {
         };
 
         for _ in 0..(stop - start + 1) {
-            let el = skiplist.remove_index(start);
+            let el = skiplist.remove(start);
             hmap.remove(&el.s);
         }
         stop - start + 1
@@ -427,11 +433,11 @@ impl ValueSortedSet {
             return vec![];
         }
 
-        let first = skiplist.get(start).unwrap();
+        let first = skiplist.get_by_index(start).unwrap();
         let mut r = vec![];
         if rev {
             for member in skiplist
-                .range(Bound::Included(first), Bound::Unbounded)
+                .range((Bound::Included(first), Bound::Unbounded))
                 .take(stop - start + 1)
             {
                 if withscores {
@@ -442,7 +448,7 @@ impl ValueSortedSet {
             r = r.iter().rev().cloned().collect::<Vec<_>>();
         } else {
             for member in skiplist
-                .range(Bound::Included(first), Bound::Unbounded)
+                .range((Bound::Included(first), Bound::Unbounded))
                 .take(stop - start + 1)
             {
                 r.push(member.get_vec().clone());
@@ -467,6 +473,20 @@ impl ValueSortedSet {
             ValueSortedSet::Data(ref skiplist, _) => skiplist,
         };
 
+        // Check if range bounds are inverted (would panic in skiplist 1.x)
+        if let (Bound::Included(s), Bound::Included(e)) = (m1, m2) {
+            if s > e { return vec![]; }
+        }
+        if let (Bound::Included(s), Bound::Excluded(e)) = (m1, m2) {
+            if s >= e { return vec![]; }
+        }
+        if let (Bound::Excluded(s), Bound::Included(e)) = (m1, m2) {
+            if s >= e { return vec![]; }
+        }
+        if let (Bound::Excluded(s), Bound::Excluded(e)) = (m1, m2) {
+            if s >= e { return vec![]; }
+        }
+
         let mut r = vec![];
         if rev {
             let len = skiplist.len();
@@ -475,14 +495,14 @@ impl ValueSortedSet {
                 c = if len > offset { len - offset } else { 0 };
             }
 
-            for member in skiplist.range(m1, m2).rev().skip(offset).take(c) {
+            for member in skiplist.range((m1, m2)).rev().skip(offset).take(c) {
                 r.push(member.get_vec().clone());
                 if withscores {
                     r.push(format!("{}", member.get_f64()).into_bytes());
                 }
             }
         } else {
-            for member in skiplist.range(m1, m2).skip(offset).take(count) {
+            for member in skiplist.range((m1, m2)).skip(offset).take(count) {
                 r.push(member.get_vec().clone());
                 if withscores {
                     r.push(format!("{}", member.get_f64()).into_bytes());
@@ -553,7 +573,7 @@ impl ValueSortedSet {
             ValueSortedSet::Data(ref skiplist, _) => skiplist,
         };
 
-        let f = skiplist.front().unwrap().get_f64();
+        let f = skiplist.first().unwrap().get_f64();
 
         // FIXME: duplicated code from ZCOUNT. Trying to create a factory
         // function for this, but I failed because allocation was going
@@ -605,7 +625,7 @@ impl ValueSortedSet {
         let member = SortedSetMember::new(*score, el);
         Some(
             skiplist
-                .range(Bound::Unbounded, Bound::Included(&member))
+                .range((Bound::Unbounded, Bound::Included(&member)))
                 .count()
                 - 1,
         )
