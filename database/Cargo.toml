@@ -4,11 +4,12 @@ name = "database"
 version = "0.1.0"
 
 [dependencies]
-crc64 = "0.2"
-rand = "0.3"
-rehashinghashmap = "0.1"
-skiplist = "0.3"
+ahash = "0.8"
+crc64 = "2.0"
+rand = "0.8"
+skiplist = "1.1"
 basichll = "0.3"
+serde_json = "1.0"
 
 [dependencies.config]
 path = "../config"

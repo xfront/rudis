@@ -43,6 +43,54 @@ pub struct Config {
     pub appendonly: bool,
     pub appendfilename: String,
     pub aof_load_truncated: bool,
+    // RDB
+    pub save: Vec<(u32, u32)>,
+    pub stop_writes_on_bgsave_error: bool,
+    pub rdbcompression: bool,
+    pub rdbchecksum: bool,
+    pub dbfilename: String,
+    // Replication
+    pub slaveof: Option<(String, u16)>,
+    pub masterauth: Option<String>,
+    pub slave_serve_stale_data: bool,
+    pub slave_read_only: bool,
+    pub repl_diskless_sync: bool,
+    pub repl_diskless_sync_delay: u32,
+    pub repl_ping_slave_period: u32,
+    pub repl_timeout: u32,
+    pub repl_disable_tcp_nodelay: bool,
+    pub repl_backlog_size: usize,
+    pub repl_backlog_ttl: u32,
+    pub slave_priority: u32,
+    pub min_slaves_to_write: u32,
+    pub min_slaves_max_lag: u32,
+    // Memory
+    pub maxclients: usize,
+    pub maxmemory: usize,
+    pub maxmemory_policy: String,
+    pub maxmemory_samples: u32,
+    // AOF
+    pub appendfsync: String,
+    pub no_appendfsync_on_rewrite: bool,
+    pub auto_aof_rewrite_percentage: u32,
+    pub auto_aof_rewrite_min_size: usize,
+    // Misc
+    pub lua_time_limit: u32,
+    pub slowlog_log_slower_than: i64,
+    pub slowlog_max_len: u32,
+    pub latency_monitor_threshold: i64,
+    pub notify_keyspace_events: String,
+    // Data structure encoding limits
+    pub hash_max_ziplist_entries: usize,
+    pub hash_max_ziplist_value: usize,
+    pub list_max_ziplist_entries: usize,
+    pub list_max_ziplist_value: usize,
+    pub zset_max_ziplist_entries: usize,
+    pub zset_max_ziplist_value: usize,
+    pub hll_sparse_max_bytes: usize,
+    // Other
+    pub client_output_buffer_limit: String,
+    pub aof_rewrite_incremental_fsync: bool,
 }
 
 #[derive(Debug)]
@@ -87,7 +135,7 @@ impl Config {
             active_rehashing: true,
             daemonize: false,
             databases: 16,
-            pidfile: "/var/run/rsedis.pid".to_owned(),
+            pidfile: "/var/run/rudis.pid".to_owned(),
             dir: "./".to_owned(),
             bind: vec![],
             port,
@@ -100,17 +148,66 @@ impl Config {
             requirepass: None,
             tcp_backlog: 511,
             syslog_enabled: false,
-            syslog_ident: "rsedis".to_owned(),
+            syslog_ident: "rudis".to_owned(),
             syslog_facility: "local0".to_owned(),
             hz: 10,
             appendonly: false,
             appendfilename: "appendonly.aof".to_owned(),
             aof_load_truncated: false,
+            // RDB
+            save: vec![],
+            stop_writes_on_bgsave_error: true,
+            rdbcompression: true,
+            rdbchecksum: true,
+            dbfilename: "dump.rdb".to_owned(),
+            // Replication
+            slaveof: None,
+            masterauth: None,
+            slave_serve_stale_data: true,
+            slave_read_only: true,
+            repl_diskless_sync: false,
+            repl_diskless_sync_delay: 5,
+            repl_ping_slave_period: 10,
+            repl_timeout: 60,
+            repl_disable_tcp_nodelay: false,
+            repl_backlog_size: 1048576,
+            repl_backlog_ttl: 3600,
+            slave_priority: 100,
+            min_slaves_to_write: 0,
+            min_slaves_max_lag: 10,
+            // Memory
+            maxclients: 10000,
+            maxmemory: 0,
+            maxmemory_policy: "noeviction".to_owned(),
+            maxmemory_samples: 5,
+            // AOF
+            appendfsync: "everysec".to_owned(),
+            no_appendfsync_on_rewrite: false,
+            auto_aof_rewrite_percentage: 100,
+            auto_aof_rewrite_min_size: 64 * 1024 * 1024,
+            // Misc
+            lua_time_limit: 5000,
+            slowlog_log_slower_than: 10000,
+            slowlog_max_len: 128,
+            latency_monitor_threshold: 0,
+            notify_keyspace_events: String::new(),
+            // Data structure encoding limits
+            hash_max_ziplist_entries: 512,
+            hash_max_ziplist_value: 64,
+            list_max_ziplist_entries: 512,
+            list_max_ziplist_value: 64,
+            zset_max_ziplist_entries: 128,
+            zset_max_ziplist_value: 64,
+            hll_sparse_max_bytes: 3000,
+            // Other
+            client_output_buffer_limit: "normal 0 0 0 slave 256mb 64mb 60 pubsub 32mb 8mb 60"
+                .to_owned(),
+            aof_rewrite_incremental_fsync: true,
         }
     }
 
     pub fn new(logger: Logger) -> Config {
-        Self::default(6379, logger)
+        Self::default(63799, logger)
     }
 
     pub fn parsefile(&mut self, fname: String) -> Result<(), ConfigError> {
@@ -204,6 +301,66 @@ impl Config {
                 b"appendonly" => self.appendonly = read_bool(args)?,
                 b"appendfilename" => self.appendfilename = read_string(args)?.to_owned(),
                 b"aof-load-truncated" => self.aof_load_truncated = read_bool(args)?,
+                // RDB
+                b"save" => {
+                    if args.len() == 3 {
+                        let seconds: u32 = from_utf8(&*args[1])?.parse().map_err(|_| ConfigError::InvalidParameter)?;
+                        let keys: u32 = from_utf8(&*args[2])?.parse().map_err(|_| ConfigError::InvalidParameter)?;
+                        self.save.push((seconds, keys));
+                    }
+                }
+                b"stop-writes-on-bgsave-error" => self.stop_writes_on_bgsave_error = read_bool(args)?,
+                b"rdbcompression" => self.rdbcompression = read_bool(args)?,
+                b"rdbchecksum" => self.rdbchecksum = read_bool(args)?,
+                b"dbfilename" => self.dbfilename = read_string(args)?.to_owned(),
+                // Replication
+                b"slaveof" => {
+                    if args.len() == 3 {
+                        let host = from_utf8(&*args[1])?.to_owned();
+                        let port: u16 = from_utf8(&*args[2])?.parse().map_err(|_| ConfigError::InvalidParameter)?;
+                        self.slaveof = Some((host, port));
+                    }
+                }
+                b"masterauth" => self.masterauth = Some(read_string(args)?.to_owned()),
+                b"slave-serve-stale-data" => self.slave_serve_stale_data = read_bool(args)?,
+                b"slave-read-only" => self.slave_read_only = read_bool(args)?,
+                b"repl-diskless-sync" => self.repl_diskless_sync = read_bool(args)?,
+                b"repl-diskless-sync-delay" => self.repl_diskless_sync_delay = read_parse(args)?,
+                b"repl-ping-slave-period" => self.repl_ping_slave_period = read_parse(args)?,
+                b"repl-timeout" => self.repl_timeout = read_parse(args)?,
+                b"repl-disable-tcp-nodelay" => self.repl_disable_tcp_nodelay = read_bool(args)?,
+                b"repl-backlog-size" => self.repl_backlog_size = read_parse(args)?,
+                b"repl-backlog-ttl" => self.repl_backlog_ttl = read_parse(args)?,
+                b"slave-priority" => self.slave_priority = read_parse(args)?,
+                b"min-slaves-to-write" => self.min_slaves_to_write = read_parse(args)?,
+                b"min-slaves-max-lag" => self.min_slaves_max_lag = read_parse(args)?,
+                // Memory
+                b"maxclients" => self.maxclients = read_parse(args)?,
+                b"maxmemory" => self.maxmemory = read_parse(args)?,
+                b"maxmemory-policy" => self.maxmemory_policy = read_string(args)?.to_owned(),
+                b"maxmemory-samples" => self.maxmemory_samples = read_parse(args)?,
+                // AOF
+                b"appendfsync" => self.appendfsync = read_string(args)?.to_owned(),
+                b"no-appendfsync-on-rewrite" => self.no_appendfsync_on_rewrite = read_bool(args)?,
+                b"auto-aof-rewrite-percentage" => self.auto_aof_rewrite_percentage = read_parse(args)?,
+                b"auto-aof-rewrite-min-size" => self.auto_aof_rewrite_min_size = read_parse(args)?,
+                // Misc
+                b"lua-time-limit" => self.lua_time_limit = read_parse(args)?,
+                b"slowlog-log-slower-than" => self.slowlog_log_slower_than = read_parse(args)?,
+                b"slowlog-max-len" => self.slowlog_max_len = read_parse(args)?,
+                b"latency-monitor-threshold" => self.latency_monitor_threshold = read_parse(args)?,
+                b"notify-keyspace-events" => self.notify_keyspace_events = read_string(args)?.to_owned(),
+                // Data structure encoding limits
+                b"hash-max-ziplist-entries" => self.hash_max_ziplist_entries = read_parse(args)?,
+                b"hash-max-ziplist-value" => self.hash_max_ziplist_value = read_parse(args)?,
+                b"list-max-ziplist-entries" => self.list_max_ziplist_entries = read_parse(args)?,
+                b"list-max-ziplist-value" => self.list_max_ziplist_value = read_parse(args)?,
+                b"zset-max-ziplist-entries" => self.zset_max_ziplist_entries = read_parse(args)?,
+                b"zset-max-ziplist-value" => self.zset_max_ziplist_value = read_parse(args)?,
+                b"hll-sparse-max-bytes" => self.hll_sparse_max_bytes = read_parse(args)?,
+                // Other
+                b"client-output-buffer-limit" => self.client_output_buffer_limit = read_string(args)?.to_owned(),
+                b"aof-rewrite-incremental-fsync" => self.aof_rewrite_incremental_fsync = read_bool(args)?,
                 b"include" => {
                     if args.len() != 2 {
                         return Err(ConfigError::InvalidFormat);
@@ -288,7 +445,7 @@ mod tests {
     fn parse_bind() {
         let config = config!(b"bind 1.2.3.4\nbind 5.6.7.8", Logger::new(Level::Warning));
         assert_eq!(config.bind, vec!["1.2.3.4", "5.6.7.8"]);
-        assert_eq!(config.port, 6379);
+        assert_eq!(config.port, 63799);
     }
 
     #[test]

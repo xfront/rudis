@@ -1,12 +1,11 @@
 extern crate libc;
 extern crate rand;
-extern crate time;
 
 use std::fmt;
+use std::time::SystemTime;
 
-use libc::types::os::arch::c95::c_int;
-use rand::{thread_rng, Rng};
-use time::get_time;
+use libc::c_int;
+use rand::{thread_rng, RngCore};
 
 /// Are two chars the same? Optionally ignoring the case.
 ///
@@ -163,8 +162,10 @@ pub fn glob_match(pattern: &[u8], element: &[u8], ignore_case: bool) -> bool {
 
 /// Current timestamp in microseconds
 pub fn ustime() -> i64 {
-    let tv = get_time();
-    tv.sec * 1000000 + (tv.nsec / 1000) as i64
+    let d = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("system time before Unix epoch");
+    d.as_secs() as i64 * 1_000_000 + (d.subsec_nanos() / 1000) as i64
 }
 
 /// Current timestamp in milliseconds
@@ -287,7 +288,7 @@ pub fn htonl(v: u32) -> [u8; 4] {
 }
 
 fn is_print(c: char) -> bool {
-    unsafe { libc::funcs::c95::ctype::isprint(c as c_int) != 0 }
+    unsafe { libc::isprint(c as c_int) != 0 }
 }
 pub fn format_repr(f: &mut fmt::Formatter, s: &[u8]) -> Result<(), fmt::Error> {
     f.write_str("\"")?;

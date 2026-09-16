@@ -177,7 +177,7 @@ pub struct Logger {
         Option<Output>,
         Option<Level>,
         Option<String>,
-        Option<Option<Box<syslog::Logger>>>,
+        Option<Box<dyn FnMut(&str) + Send>>,
         Option<i32>,
     )>,
 }
@@ -207,13 +207,13 @@ impl Logger {
             Option<Output>,
             Option<Level>,
             Option<String>,
-            Option<Option<Box<syslog::Logger>>>,
+            Option<Box<dyn FnMut(&str) + Send>>,
             Option<i32>,
         )>();
         {
             let mut level = level;
             let mut output = output;
-            let mut syslog_writer: Option<Box<syslog::Logger>> = None;
+            let mut syslog_writer: Option<Box<dyn FnMut(&str) + Send>> = None;
             thread::spawn(move || {
                 while let Ok((out, lvl, msg, syslog, code)) = rx.recv() {
                     match (out, lvl, msg, syslog) {
@@ -222,28 +222,11 @@ impl Logger {
                                 match write!(output, "{}", format!("{}\n", msg)) {
                                     Ok(_) => (),
                                     Err(e) => {
-                                        // failing to log a message... will write straight to stderr
-                                        // if we cannot do that, we'll panic
                                         eprint!("Failed to log {:?} {}", e, msg);
                                     }
                                 };
                                 if let Some(ref mut w) = syslog_writer {
-                                    match w.send_3164(
-                                        match lvl {
-                                            Level::Debug => syslog::Severity::LOG_DEBUG,
-                                            Level::Verbose => syslog::Severity::LOG_INFO,
-                                            Level::Notice => syslog::Severity::LOG_NOTICE,
-                                            Level::Warning => syslog::Severity::LOG_WARNING,
-                                        },
-                                        msg.clone(),
-                                    ) {
-                                        Ok(_) => (),
-                                        Err(e) => {
-                                            // failing to log a message... will write straight to stderr
-                                            // if we cannot do that, we'll panic
-                                            eprint!("Failed to log {:?} {}", e, msg);
-                                        }
-                                    }
+                                    w(&msg);
                                 }
                             }
                         }
@@ -254,7 +237,7 @@ impl Logger {
                             output = out;
                         }
                         (_, _, _, Some(syslog)) => {
-                            syslog_writer = syslog;
+                            syslog_writer = Some(syslog);
                         }
                         (out, lvl, msg, syslog) => {
                             panic!("Unknown message {:?}", (out, lvl, msg, syslog.is_some()));
@@ -372,7 +355,7 @@ impl Logger {
     /// Disables syslog
     #[cfg(unix)]
     pub fn disable_syslog(&mut self) {
-        self.tx.send((None, None, None, Some(None), None)).unwrap();
+        self.tx.send((None, None, None, None, None)).unwrap();
     }
 
     #[cfg(not(unix))]
@@ -381,22 +364,37 @@ impl Logger {
     /// Enables syslog.
     #[cfg(unix)]
     pub fn set_syslog(&mut self, ident: &str, facility: &str) {
-        let mut w = syslog::unix(match &*facility.to_ascii_lowercase() {
-            "local0" => syslog::Facility::LOG_LOCAL0,
-            "local1" => syslog::Facility::LOG_LOCAL1,
-            "local2" => syslog::Facility::LOG_LOCAL2,
-            "local3" => syslog::Facility::LOG_LOCAL3,
-            "local4" => syslog::Facility::LOG_LOCAL4,
-            "local5" => syslog::Facility::LOG_LOCAL5,
-            "local6" => syslog::Facility::LOG_LOCAL6,
-            "local7" => syslog::Facility::LOG_LOCAL7,
-            _ => syslog::Facility::LOG_USER,
-        })
-        .unwrap();
-        w.set_process_name(ident.to_owned());
-        self.tx
-            .send((None, None, None, Some(Some(w)), None))
-            .unwrap();
+        use syslog::{Facility, Formatter3164};
+        let facility = match &*facility.to_ascii_lowercase() {
+            "local0" => Facility::LOG_LOCAL0,
+            "local1" => Facility::LOG_LOCAL1,
+            "local2" => Facility::LOG_LOCAL2,
+            "local3" => Facility::LOG_LOCAL3,
+            "local4" => Facility::LOG_LOCAL4,
+            "local5" => Facility::LOG_LOCAL5,
+            "local6" => Facility::LOG_LOCAL6,
+            "local7" => Facility::LOG_LOCAL7,
+            _ => Facility::LOG_USER,
+        };
+        let formatter = Formatter3164 {
+            facility,
+            hostname: None,
+            process: ident.to_owned(),
+            pid: 0,
+        };
+        match syslog::unix(formatter) {
+            Ok(mut writer) => {
+                let syslog_fn: Box<dyn FnMut(&str) + Send> = Box::new(move |msg: &str| {
+                    let _ = writer.err(msg);
+                });
+                self.tx
+                    .send((None, None, None, Some(syslog_fn), None))
+                    .unwrap();
+            }
+            Err(e) => {
+                eprint!("Failed to connect to syslog: {:?}", e);
+            }
+        }
     }
 
     #[cfg(not(unix))]
