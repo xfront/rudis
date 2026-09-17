@@ -11,7 +11,7 @@ use rdbutil::{encode_u16_to_slice_u8, encode_u32_to_slice_u8, encode_u64_to_slic
 use rand::Rng;
 use rand::thread_rng;
 
-#[derive(PartialEq, Debug, Clone)]
+#[derive(PartialEq, Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum ValueSet {
     Integer(HashSet<usize>),
     Data(HashSet<Vec<u8>>),

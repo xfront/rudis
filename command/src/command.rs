@@ -4816,8 +4816,9 @@ fn save_command(parser: &mut ParsedCommand, _db: &Database) -> Response {
 
 fn lastsave_command(parser: &mut ParsedCommand, db: &Database) -> Response {
     validate_arguments_exact!(parser, 1);
-    // Return start time as last save time (no RDB save implemented yet)
-    Response::Integer(db.start_mstime / 1000)
+    // Return the Unix timestamp (seconds) of the last successful RDB save.
+    let last_save_ms = db.stats.last_save_time.load(Ordering::Relaxed);
+    Response::Integer(last_save_ms / 1000)
 }
 
 fn shutdown_command(parser: &mut ParsedCommand, _db: &Database) -> Response {

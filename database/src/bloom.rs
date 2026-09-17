@@ -11,7 +11,7 @@ use std::collections::hash_map::DefaultHasher;
 // ============================================================================
 
 /// A Bloom filter implementation.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct BloomFilter {
     /// The bit vector.
     pub bits: Vec<u8>,
@@ -135,7 +135,7 @@ pub struct BloomFilterInfo {
 // ============================================================================
 
 /// A Cuckoo filter implementation.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CuckooFilter {
     /// Buckets, each containing up to `bucket_size` fingerprints.
     pub buckets: Vec<Vec<u16>>,
@@ -299,14 +299,14 @@ pub struct CuckooFilterInfo {
 // ============================================================================
 
 /// A centroid in the t-digest.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 struct Centroid {
     mean: f64,
     count: f64,
 }
 
 /// A simplified t-digest for quantile estimation.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TDigest {
     centroids: Vec<Centroid>,
     compression: f64,
@@ -518,7 +518,7 @@ impl TDigest {
 // ============================================================================
 
 /// A Top-K data structure for tracking the K most frequent items.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TopK {
     k: usize,
     width: usize,

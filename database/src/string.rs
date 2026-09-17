@@ -10,7 +10,7 @@ use rdbutil::{encode_i64, encode_slice_u8, EncodeError};
 
 const HLL_ERROR: f64 = 0.0019;
 
-#[derive(PartialEq, Debug, Clone)]
+#[derive(PartialEq, Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum ValueString {
     Integer(i64),
     Data(Vec<u8>),

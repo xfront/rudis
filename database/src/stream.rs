@@ -3,7 +3,7 @@ use std::collections::{HashMap, VecDeque};
 use error::OperationError;
 
 /// A Stream ID, consisting of milliseconds timestamp and a sequence number.
-#[derive(PartialEq, Eq, Debug, Clone, Copy)]
+#[derive(PartialEq, Eq, Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct StreamID {
     pub ms: u64,
     pub seq: u64,
@@ -67,14 +67,14 @@ impl Ord for StreamID {
 }
 
 /// A single entry in a Stream.
-#[derive(PartialEq, Debug, Clone)]
+#[derive(PartialEq, Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StreamEntry {
     pub id: StreamID,
     pub fields: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 /// A pending entry tracked by a consumer group.
-#[derive(PartialEq, Debug, Clone)]
+#[derive(PartialEq, Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PendingEntry {
     pub id: StreamID,
     pub consumer: Vec<u8>,
@@ -83,14 +83,14 @@ pub struct PendingEntry {
 }
 
 /// A consumer within a consumer group.
-#[derive(PartialEq, Debug, Clone)]
+#[derive(PartialEq, Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Consumer {
     pub name: Vec<u8>,
     pub last_seen: i64,
 }
 
 /// A consumer group for a Stream.
-#[derive(PartialEq, Debug, Clone)]
+#[derive(PartialEq, Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ConsumerGroup {
     /// Last delivered ID for this group.
     pub last_id: StreamID,
@@ -114,7 +114,7 @@ impl ConsumerGroup {
 }
 
 /// A Stream value stored in the database.
-#[derive(PartialEq, Debug, Clone)]
+#[derive(PartialEq, Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ValueStream {
     /// Entries in chronological order (oldest first).
     entries: VecDeque<StreamEntry>,
@@ -703,6 +703,16 @@ impl ValueStream {
         };
 
         Ok((result.into_iter().flatten().collect(), next_cursor))
+    }
+
+    /// Returns all entries in the stream (for AOF rewrite).
+    pub fn all_entries(&self) -> &VecDeque<StreamEntry> {
+        &self.entries
+    }
+
+    /// Returns all consumer groups as a reference (for AOF rewrite).
+    pub fn all_groups(&self) -> &HashMap<Vec<u8>, ConsumerGroup> {
+        &self.groups
     }
 }
 

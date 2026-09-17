@@ -1,5 +1,6 @@
 extern crate ahash;
 extern crate basichll;
+extern crate bincode;
 extern crate config;
 #[macro_use(log)]
 extern crate logger;
@@ -9,6 +10,7 @@ extern crate persistence;
 extern crate rand;
 extern crate rdbutil;
 extern crate response;
+extern crate serde;
 extern crate serde_json;
 extern crate skiplist;
 extern crate util;
@@ -22,6 +24,8 @@ pub mod geo;
 pub mod hash;
 pub mod json;
 pub mod list;
+pub mod rdb;
+pub mod aof_rewrite;
 pub mod search;
 pub mod sentinel;
 pub mod shard;
@@ -74,7 +78,7 @@ use zset::ValueSortedSet;
 const ACTIVE_EXPIRE_CYCLE_LOOKUPS_PER_LOOP: usize = 20;
 
 /// Any value storable in the database
-#[derive(PartialEq, Debug, Clone)]
+#[derive(PartialEq, Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Value {
     /// Nil should not be stored, but it is used as a default for initialized values
     Nil,
@@ -2353,6 +2357,8 @@ pub struct Stats {
     pub rejected_connections: AtomicU64,
     /// Write commands since the last successful save.
     pub rdb_changes_since_last_save: AtomicU64,
+    /// Millisecond timestamp of the last successful RDB save.
+    pub last_save_time: AtomicI64,
     /// Historical maximum of used memory, in bytes.
     pub used_memory_peak: AtomicU64,
     /// Time of the last ops/sec sample, in milliseconds.
@@ -2372,6 +2378,9 @@ impl Stats {
             // Start the ops/sec sampling window at creation time, otherwise the
             // first INFO would divide the command count by the whole Unix epoch.
             last_sample_mstime: AtomicI64::new(mstime()),
+            // Stamp the save time so auto-save doesn't fire immediately on boot
+            // when no RDB has been loaded or saved yet.
+            last_save_time: AtomicI64::new(mstime()),
             ..Stats::default()
         })
     }
@@ -2387,6 +2396,28 @@ impl Stats {
     pub fn record_write(&self) {
         self.rdb_changes_since_last_save
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records a successful RDB save: resets the dirty counter and stamps now.
+    pub fn record_save(&self) {
+        self.rdb_changes_since_last_save.store(0, Ordering::Relaxed);
+        self.last_save_time.store(mstime(), Ordering::Relaxed);
+    }
+
+    /// Returns `true` when any `save <seconds> <changes>` threshold is met:
+    /// at least `seconds` elapsed since the last save AND at least `changes`
+    /// write operations occurred in that window.
+    pub fn should_auto_save(&self, save_points: &[(u32, u32)]) -> bool {
+        if save_points.is_empty() {
+            return false;
+        }
+        let now = mstime();
+        let last = self.last_save_time.load(Ordering::Relaxed);
+        let elapsed_sec = ((now - last) / 1000) as u64;
+        let dirty = self.rdb_changes_since_last_save.load(Ordering::Relaxed) as u64;
+        save_points.iter().any(|&(secs, changes)| {
+            elapsed_sec >= secs as u64 && dirty >= changes as u64
+        })
     }
 
     /// Records a successful key lookup.
@@ -2911,7 +2942,7 @@ impl Database {
     }
 
     /// Gets a key expiration time, in milliseconds.
-    pub fn get_msexpiration(&mut self, index: usize, key: &[u8]) -> Option<&i64> {
+    pub fn get_msexpiration(&self, index: usize, key: &[u8]) -> Option<&i64> {
         self.data_expiration_ms[index].get(key)
     }
 

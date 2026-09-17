@@ -6,7 +6,7 @@ use std::{
     process,
     sync::mpsc::{channel, Receiver, Sender},
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
     thread,
@@ -27,6 +27,28 @@ use parser::{OwnedParsedCommand, ParseError, Parser};
 use response::{Response, ResponseError};
 
 pub mod cluster_bus;
+
+/// Global flag set by the signal handler (SIGTERM/SIGINT) to request a
+/// graceful shutdown.  The main loop in `run()` polls this flag and calls
+/// `stop()` when it becomes `true`.
+static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Install POSIX signal handlers for SIGTERM and SIGINT so the server can
+/// perform a graceful shutdown (save RDB, flush AOF) instead of exiting
+/// immediately.
+#[cfg(unix)]
+fn install_signal_handlers() {
+    unsafe {
+        extern "C" fn handle_signal(_sig: libc::c_int) {
+            SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+        }
+        libc::signal(libc::SIGTERM, handle_signal as libc::sighandler_t);
+        libc::signal(libc::SIGINT, handle_signal as libc::sighandler_t);
+    }
+}
+
+#[cfg(not(unix))]
+fn install_signal_handlers() {}
 
 /// A stream connection.
 #[cfg(unix)]
@@ -193,6 +215,8 @@ pub struct Server {
     pub next_id: Arc<AtomicUsize>,
     /// Sender to signal hz thread to stop
     hz_stop: Option<Sender<()>>,
+    /// Handle to the hz thread so we can join it before shutdown save.
+    hz_handle: Option<thread::JoinHandle<()>>,
     /// Cluster bus stop flag
     cluster_bus_stop: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// Cluster bus listener thread
@@ -553,6 +577,41 @@ impl Client {
             let r = {
                 // Dragonfly-inspired: route to the correct shard based on the first key
                 let num_shards = self.db.num_shards();
+
+                // Intercept SAVE/BGSAVE/BGREWRITEAOF before acquiring shard lock to avoid
+                // deadlock (save_to_file / rewrite_aof needs to lock all shards).
+                let cmd_name = parsed_command.get_str(0).unwrap_or("");
+                if cmd_name.eq_ignore_ascii_case("save") || cmd_name.eq_ignore_ascii_case("bgsave") {
+                    let rdb_path = {
+                        let shard = self.db.shard_write(0, 0).unwrap();
+                        format!("{}/{}", shard.db.config.dir, shard.db.config.dbfilename)
+                    };
+                    match database::rdb::save_to_file(&self.db, &rdb_path) {
+                        Ok(n) => {
+                            self.db.stats.record_save();
+                            let _ = sendlog!(sender, Notice, "RDB: saved {} keys to {}", n, rdb_path);
+                            Ok(Response::Status("OK".to_owned()))
+                        }
+                        Err(e) => {
+                            Ok(Response::Error(format!("ERR saving RDB: {}", e)))
+                        }
+                    }
+                } else if cmd_name.eq_ignore_ascii_case("bgrewriteaof") {
+                    let (aof_base, num_shards) = {
+                        let shard = self.db.shard_write(0, 0).unwrap();
+                        (shard.db.config.appendfilename.clone(), self.db.num_shards())
+                    };
+                    match database::aof_rewrite::rewrite_all_aofs(&self.db, &aof_base, num_shards) {
+                        Ok(results) => {
+                            let total: usize = results.iter().map(|(_, n)| n).sum();
+                            let _ = sendlog!(sender, Notice, "AOF rewrite: rewrote {} keys across {} shards", total, num_shards);
+                            Ok(Response::Status("Background append only file rewriting started".to_owned()))
+                        }
+                        Err(e) => {
+                            Ok(Response::Error(format!("ERR rewriting AOF: {}", e)))
+                        }
+                    }
+                } else {
                 let shard_idx = Self::shard_for_command(&parsed_command, num_shards);
                 let mut shard = match self.db.shard_write(0, shard_idx) {
                     Ok(shard) => shard,
@@ -561,6 +620,7 @@ impl Client {
 
                 // execute the command on the shard's database
                 command::command(parsed_command, &mut shard.db, &mut client)
+                }
             };
 
             // check out the response
@@ -697,6 +757,7 @@ impl Server {
             listener_threads: Vec::new(),
             next_id: Arc::new(AtomicUsize::default()),
             hz_stop: None,
+            hz_handle: None,
             cluster_bus_stop: None,
             cluster_bus_handle: None,
             gossip_stop: None,
@@ -712,6 +773,7 @@ impl Server {
     /// Runs the server. If `config.daemonize` is true, it forks and exits.
     #[cfg(unix)]
     pub fn run(&mut self) {
+        install_signal_handlers();
         let (daemonize, pidfile) = (self.config.daemonize, self.config.pidfile.clone());
         if daemonize {
             if unsafe { libc::daemon(1, 1) } == 0 {
@@ -724,13 +786,15 @@ impl Server {
                     }
                 }
                 self.start();
-                self.join();
+                self.wait_for_shutdown();
+                self.stop();
             } else {
                 panic!("Fork failed");
             }
         } else {
             self.start();
-            self.join();
+            self.wait_for_shutdown();
+            self.stop();
         }
     }
 
@@ -741,7 +805,8 @@ impl Server {
             panic!("Cannot daemonize in non-unix");
         } else {
             self.start();
-            self.join();
+            self.wait_for_shutdown();
+            self.stop();
         }
     }
 
@@ -760,6 +825,15 @@ impl Server {
     pub fn join(&mut self) {
         while !self.listener_threads.is_empty() {
             let _ = self.listener_threads.pop().unwrap().join();
+        }
+    }
+
+    /// Block until a shutdown signal (SIGTERM/SIGINT) is received or the
+    /// server is otherwise asked to stop.  Polls the global atomic flag
+    /// installed by the signal handler.
+    fn wait_for_shutdown(&self) {
+        while !SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(250));
         }
     }
 
@@ -837,7 +911,9 @@ impl Server {
             let hz = self.config.hz;
             let db_ref = self.db.clone();
             let num_shards = db_ref.num_shards();
-            thread::spawn(move || {
+            let save_points = self.config.save.clone();
+            let rdb_path = format!("{}/{}", self.config.dir, self.config.dbfilename);
+            let hz_handle = thread::spawn(move || {
                 let mut shard_cursor = 0usize;
                 while hz_stop_rx.try_recv().is_err() {
                     // Roll the ops/sec sampling window (like Redis's serverCron)
@@ -850,18 +926,71 @@ impl Server {
                         shard.db.active_expire_cycle(10);
                     }
                     shard_cursor = (shard_cursor + 1) % num_shards;
+
+                    // Check if any save threshold is met and trigger auto-RDB.
+                    // Skip auto-save if a graceful shutdown is in progress to
+                    // avoid the hz thread's rename overwriting the shutdown save.
+                    if !SHUTDOWN_REQUESTED.load(Ordering::SeqCst)
+                        && db_ref.stats.should_auto_save(&save_points)
+                    {
+                        match database::rdb::save_to_file(&db_ref, &rdb_path) {
+                            Ok(n) => {
+                                db_ref.stats.record_save();
+                                eprintln!("RDB: auto-save {} keys to {}", n, rdb_path);
+                            }
+                            Err(e) => {
+                                eprintln!("RDB: auto-save failed: {}", e);
+                            }
+                        }
+                    }
+
                     thread::sleep(Duration::from_millis(10000 / hz as u64));
                 }
             });
+            self.hz_handle = Some(hz_handle);
         }
 
-        // Load AOF if configured (on shard 0)
+        // Load RDB snapshot if it exists (before AOF, so AOF can replay on top)
+        {
+            let rdb_path = {
+                let shard = self.db.shard_write(0, 0).unwrap();
+                format!("{}/{}", shard.db.config.dir, shard.db.config.dbfilename)
+            };
+            if database::rdb::rdb_exists(&rdb_path) {
+                match database::rdb::load_from_file(&rdb_path) {
+                    Ok(snapshot) => {
+                        database::rdb::apply_snapshot(&self.db, snapshot);
+                        self.db.stats.record_save(); // initialize last_save_time
+                        log!(self.config.logger, Notice, "Loaded RDB snapshot from {}", rdb_path);
+                    }
+                    Err(e) => {
+                        log!(self.config.logger, Warning, "Failed to load RDB from {}: {}", rdb_path, e);
+                    }
+                }
+            }
+        }
+
+        // Load AOF if configured (on all shards, one AOF file per shard)
         if self.config.appendonly {
-            if let Ok(mut shard) = self.db.shard_write(0, 0) {
-                // Initialize AOF for this shard
-                shard.db.aof = Some(persistence::aof::Aof::new(&*self.config.appendfilename).unwrap());
-                if shard.db.aof.is_some() {
-                    command::aof::load(&mut shard.db);
+            let fsync_policy = persistence::aof::AofFsyncPolicy::from_str(&self.config.appendfsync);
+            let num_shards = self.db.num_shards();
+            for shard_idx in 0..num_shards {
+                if let Ok(mut shard) = self.db.shard_write(0, shard_idx) {
+                    let aof_path = if num_shards > 1 {
+                        format!("{}.{}", self.config.appendfilename, shard_idx)
+                    } else {
+                        self.config.appendfilename.clone()
+                    };
+                    match persistence::aof::Aof::with_fsync_policy(&aof_path, fsync_policy.clone()) {
+                        Ok(aof) => {
+                            shard.db.aof = Some(aof);
+                            command::aof::load(&mut shard.db);
+                            log!(self.config.logger, Notice, "Loaded AOF for shard {} from {} (fsync={:?})", shard_idx, aof_path, fsync_policy);
+                        }
+                        Err(e) => {
+                            log!(self.config.logger, Warning, "Failed to open AOF for shard {}: {:?}", shard_idx, e);
+                        }
+                    }
                 }
             }
         }
@@ -958,6 +1087,11 @@ impl Server {
         if let Some(t) = &self.hz_stop {
             let _ = t.send(());
         }
+        // Wait for the hz thread to finish so its auto-save cannot race
+        // with the shutdown RDB save below (both write the same temp file).
+        if let Some(h) = self.hz_handle.take() {
+            let _ = h.join();
+        }
         // Stop cluster bus and gossip timer
         if let Some(stop) = &self.cluster_bus_stop {
             stop.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -970,6 +1104,39 @@ impl Server {
             if let Ok(shard) = self.db.shard_write(0, 0) {
                 let _ = database::cluster::save_cluster_config(&shard.db.cluster, &shard.db.cluster.config_file.clone());
             }
+        }
+        // Save RDB snapshot on shutdown
+        {
+            let rdb_path = {
+                if let Ok(shard) = self.db.shard_write(0, 0) {
+                    format!("{}/{}", shard.db.config.dir, shard.db.config.dbfilename)
+                } else {
+                    String::new()
+                }
+            };
+            if !rdb_path.is_empty() {
+                match database::rdb::save_to_file(&self.db, &rdb_path) {
+                    Ok(n) => {
+                        self.db.stats.record_save();
+                        eprintln!("RDB: saved {} keys to {} on shutdown", n, rdb_path);
+                    }
+                    Err(e) => {
+                        eprintln!("RDB: failed to save on shutdown: {}", e);
+                    }
+                }
+            }
+        }
+        // Flush AOF files on shutdown (one per shard)
+        if self.config.appendonly {
+            let num_shards = self.db.num_shards();
+            for shard_idx in 0..num_shards {
+                if let Ok(mut shard) = self.db.shard_write(0, shard_idx) {
+                    if let Some(ref mut aof) = shard.db.aof {
+                        let _ = aof.do_fsync();
+                    }
+                }
+            }
+            eprintln!("AOF: flushed {} shard AOF files on shutdown", num_shards);
         }
         self.join();
     }

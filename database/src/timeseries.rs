@@ -5,14 +5,14 @@
 use std::collections::BTreeMap;
 
 /// A single sample in the time series.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Sample {
     pub timestamp: i64,
     pub value: f64,
 }
 
 /// Duplicate policy for handling same-timestamp inserts.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum DuplicatePolicy {
     Block,
     First,
@@ -23,7 +23,7 @@ pub enum DuplicatePolicy {
 }
 
 /// A time series data structure.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TimeSeries {
     /// Samples stored by timestamp.
     pub samples: BTreeMap<i64, f64>,

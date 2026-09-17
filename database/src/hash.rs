@@ -10,7 +10,7 @@ use rdbutil::{encode_len, encode_slice_u8};
 /// A hash value stored in the database.
 /// Internally uses a HashMap<Vec<u8>, Vec<u8>> mapping field names to values.
 /// Per-field expiration is tracked via field_expiration_ms.
-#[derive(PartialEq, Debug, Clone)]
+#[derive(PartialEq, Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ValueHash {
     data: HashMap<Vec<u8>, Vec<u8>>,
     /// Per-field expiration times in milliseconds (absolute timestamps).

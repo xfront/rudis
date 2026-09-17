@@ -5,7 +5,7 @@
 use serde_json;
 
 /// A JSON value stored in the database.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ValueJson {
     pub value: serde_json::Value,
 }

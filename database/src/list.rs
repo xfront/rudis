@@ -7,7 +7,7 @@ use error::OperationError;
 use rdbutil::constants::*;
 use rdbutil::{encode_len, encode_slice_u8};
 
-#[derive(PartialEq, Debug, Clone)]
+#[derive(PartialEq, Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum ValueList {
     Data(LinkedList<Vec<u8>>),
 }

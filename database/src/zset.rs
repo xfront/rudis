@@ -6,6 +6,7 @@ use std::f64::{INFINITY, NEG_INFINITY};
 use std::io;
 use std::io::Write;
 
+use serde;
 use skiplist::OrderedSkipList;
 
 use dbutil::normalize_position;
@@ -24,12 +25,13 @@ pub enum Aggregate {
  * f64 does not implement those traits because comparing floats has problems
  * but in the context of rudis this basic implementation should be enough.
  **/
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SortedSetMember {
     f: f64,
     s: Vec<u8>,
     // this is useful for inclusion/exclusion comparison
     // if true, it will ignore `s` and be the highest possible string
+    #[serde(skip)]
     upper_boundary: bool,
 }
 
@@ -706,6 +708,45 @@ impl ValueSortedSet {
              lru_seconds_idle:0",
             encoding, serialized
         )
+    }
+}
+
+// Manual serde implementation for ValueSortedSet since OrderedSkipList
+// does not implement Serialize/Deserialize
+impl serde::Serialize for ValueSortedSet {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        match self {
+            ValueSortedSet::Data(_, hmap) => {
+                let mut state = serializer.serialize_struct("ValueSortedSet", 1)?;
+                let members: Vec<(Vec<u8>, f64)> = hmap.iter().map(|(k, v)| (k.clone(), *v)).collect();
+                state.serialize_field("members", &members)?;
+                state.end()
+            }
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ValueSortedSet {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        struct ValueSortedSetData {
+            members: Vec<(Vec<u8>, f64)>,
+        }
+        let data = ValueSortedSetData::deserialize(deserializer)?;
+        let mut skiplist = OrderedSkipList::new();
+        let mut hmap = HashMap::new();
+        for (member, score) in data.members {
+            skiplist.insert(SortedSetMember::new(score, member.clone()));
+            hmap.insert(member, score);
+        }
+        Ok(ValueSortedSet::Data(skiplist, hmap))
     }
 }
 
