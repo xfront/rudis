@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use crc64::crc64;
 
-use crate::Database;
+use crate::{Database, Stats};
 
 /// Default number of shards per database index.
 /// Dragonfly uses one shard per thread; we use a fixed count that can be
@@ -28,6 +28,14 @@ impl Shard {
     pub fn new(config: &config::Config) -> Self {
         Shard {
             db: Database::new_shard(config),
+        }
+    }
+
+    /// Creates a new empty shard sharing the given statistics block with
+    /// the other shards of a ShardedDatabase.
+    pub fn with_stats(config: &config::Config, stats: Arc<Stats>) -> Self {
+        Shard {
+            db: Database::new_shard_with_stats(config, stats),
         }
     }
 }
@@ -56,9 +64,51 @@ pub struct ShardedDatabase {
 
     /// Number of shards per database index.
     num_shards: usize,
+
+    /// Server-wide statistics shared by every shard (read by INFO).
+    pub stats: Arc<Stats>,
 }
 
 impl ShardedDatabase {
+    /// Links every shard's Database back to this ShardedDatabase (weakly,
+    /// with its own shard index) so admin commands (INFO/DBSIZE) can
+    /// aggregate keyspace data across shards. Call once after the sharded
+    /// database has been wrapped in an Arc.
+    pub fn init_shard_links(self: &Arc<Self>) {
+        for db_shards in &self.shards {
+            for (shard_idx, shard) in db_shards.iter().enumerate() {
+                let mut shard = shard.lock().unwrap();
+                shard.db.sharded = Some((Arc::downgrade(self), shard_idx));
+            }
+        }
+    }
+
+    /// Aggregates `(keys, expires, ttl_sum, ttl_keys)` for one database index
+    /// across all shards, optionally skipping one shard (the one whose lock is
+    /// already held by the caller, which passes its own data instead).
+    pub fn keyspace_stats_except(
+        &self,
+        db_index: usize,
+        except: Option<usize>,
+    ) -> (usize, usize, i64, usize) {
+        let mut keys = 0usize;
+        let mut expires = 0usize;
+        let mut ttl_sum = 0i64;
+        let mut ttl_keys = 0usize;
+        for (shard_idx, shard) in self.shards[db_index].iter().enumerate() {
+            if Some(shard_idx) == except {
+                continue;
+            }
+            let shard = shard.lock().unwrap();
+            let (k, e, s, c) = shard.db.keyspace_summary(db_index);
+            keys += k;
+            expires += e;
+            ttl_sum += s;
+            ttl_keys += c;
+        }
+        (keys, expires, ttl_sum, ttl_keys)
+    }
+
     /// Creates a new ShardedDatabase with the default number of shards.
     pub fn new(config: &config::Config) -> Self {
         Self::with_shards(config, DEFAULT_SHARDS_PER_DB)
@@ -68,10 +118,11 @@ impl ShardedDatabase {
     pub fn with_shards(config: &config::Config, num_shards: usize) -> Self {
         let num_databases = config.databases as usize;
         let mut shards = Vec::with_capacity(num_databases);
+        let stats = Stats::new();
 
         for _db_index in 0..num_databases {
             let db_shards = (0..num_shards)
-                .map(|_| Arc::new(Mutex::new(Shard::new(config))))
+                .map(|_| Arc::new(Mutex::new(Shard::with_stats(config, stats.clone()))))
                 .collect();
             shards.push(db_shards);
         }
@@ -80,6 +131,7 @@ impl ShardedDatabase {
             shards,
             num_databases,
             num_shards,
+            stats,
         }
     }
 

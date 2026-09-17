@@ -2,6 +2,7 @@ use std::{
     collections::{Bound, HashMap, HashSet},
     io::Write,
     mem::replace,
+    sync::atomic::Ordering,
     sync::mpsc::channel,
     sync::mpsc::Sender,
     thread,
@@ -276,7 +277,8 @@ fn debug(parser: &mut ParsedCommand, db: &mut Database, dbindex: usize) -> Respo
 
 fn dbsize(parser: &mut ParsedCommand, db: &mut Database, dbindex: usize) -> Response {
     validate_arguments_exact!(parser, 1);
-    Response::Integer(db.dbsize(dbindex) as i64)
+    // Aggregated across shards so the count includes keys routed to other shards.
+    Response::Integer(db.aggregated_keyspace(dbindex).0 as i64)
 }
 
 fn dump(parser: &mut ParsedCommand, db: &mut Database, dbindex: usize) -> Response {
@@ -2360,6 +2362,47 @@ const BITS: usize = 32;
 #[cfg(all(target_pointer_width = "64"))]
 const BITS: usize = 64;
 
+/// Reads the resident set size, in bytes, from the OS (Linux only).
+#[cfg(target_os = "linux")]
+fn rss_bytes() -> u64 {
+    if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("VmRSS:") {
+                let kb: u64 = rest
+                    .trim()
+                    .trim_end_matches("kB")
+                    .trim()
+                    .parse()
+                    .unwrap_or(0);
+                return kb * 1024;
+            }
+        }
+    }
+    0
+}
+
+/// Reads the resident set size, in bytes, from the OS (unsupported platform).
+#[cfg(not(target_os = "linux"))]
+fn rss_bytes() -> u64 {
+    0
+}
+
+/// Formats a byte count the way Redis does (e.g. `1.50M`).
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [char; 5] = ['B', 'K', 'M', 'G', 'T'];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{}B", bytes)
+    } else {
+        format!("{:.2}{}", value, UNITS[unit])
+    }
+}
+
 fn info(parser: &mut ParsedCommand, db: &Database) -> Response {
     validate_arguments_lte!(parser, 2);
     let section = &*(if parser.argv.len() == 1 {
@@ -2380,6 +2423,7 @@ fn info(parser: &mut ParsedCommand, db: &Database) -> Response {
                 out,
                 "# Server\r\n\
                  rudis_version:{}\r\n\
+                 redis_version:{}\r\n\
                  rudis_git_sha1:{}\r\n\
                  rudis_git_dirty:{}\r\n\
                  os:{} {} {}\r\n\
@@ -2394,6 +2438,7 @@ fn info(parser: &mut ParsedCommand, db: &Database) -> Response {
                  lru_clock:{}\r\n\
                  \r\n\
                  ",
+                db.version,
                 db.version,
                 db.git_sha1,
                 if db.git_dirty { 1 } else { 0 },
@@ -2412,36 +2457,62 @@ fn info(parser: &mut ParsedCommand, db: &Database) -> Response {
     }
 
     if section == "default" || show_all || section == "clients" {
+        let connected_clients = db
+            .stats
+            .connected_clients
+            .load(Ordering::Relaxed)
+            .max(0);
         try_validate!(
             write!(
                 out,
                 "# Clients\r\n\
-                 connected_clients:1\r\n\
+                 connected_clients:{}\r\n\
+                 maxclients:{}\r\n\
                  client_longest_output_list:0\r\n\
                  client_biggest_input_buf:0\r\n\
                  blocked_clients:0\r\n\
                  \r\n\
-                 "
+                 ",
+                connected_clients,
+                db.config.maxclients,
             ),
             "ERR unexpected"
         );
     }
 
     if section == "default" || show_all || section == "memory" {
+        let rss = rss_bytes();
+        let peak = db.stats.track_memory(rss);
         try_validate!(
             write!(
                 out,
                 "# Memory\r\n\
-                 used_memory:0\r\n\
-                 used_memory_human:0B\r\n\
-                 used_memory_rss:0\r\n\
-                 used_memory_peak:0\r\n\
-                 used_memory_peak_human:0B\r\n\
+                 used_memory:{}\r\n\
+                 used_memory_human:{}\r\n\
+                 used_memory_rss:{}\r\n\
+                 used_memory_rss_human:{}\r\n\
+                 used_memory_peak:{}\r\n\
+                 used_memory_peak_human:{}\r\n\
                  used_memory_lua:0\r\n\
+                 used_memory_overhead:0\r\n\
+                 used_memory_dataset:{}\r\n\
+                 maxmemory:{}\r\n\
+                 maxmemory_human:{}\r\n\
+                 maxmemory_policy:{}\r\n\
                  mem_fragmentation_ratio:1.00\r\n\
                  mem_allocator:system\r\n\
                  \r\n\
-                 "
+                 ",
+                rss,
+                human_bytes(rss),
+                rss,
+                human_bytes(rss),
+                peak,
+                human_bytes(peak),
+                rss,
+                db.config.maxmemory,
+                human_bytes(db.config.maxmemory as u64),
+                db.config.maxmemory_policy,
             ),
             "ERR unexpected"
         );
@@ -2454,8 +2525,8 @@ fn info(parser: &mut ParsedCommand, db: &Database) -> Response {
             write!(
                 out,
                 "# Persistence\r\n\
-                 loading:0\r\n\
-                 rdb_changes_since_last_save:0\r\n\
+                 loading:{}\r\n\
+                 rdb_changes_since_last_save:{}\r\n\
                  rdb_bgsave_in_progress:0\r\n\
                  rdb_last_save_time:{}\r\n\
                  rdb_last_bgsave_status:ok\r\n\
@@ -2467,9 +2538,11 @@ fn info(parser: &mut ParsedCommand, db: &Database) -> Response {
                  aof_last_rewrite_time_sec:-1\r\n\
                  aof_current_rewrite_time_sec:-1\r\n\
                  aof_last_bgrewrite_status:ok\r\n\
-                 changes_since_last_save:0\r\n\
+                 aof_delayed_fsync:0\r\n\
                  \r\n\
                  ",
+                if db.loading { 1 } else { 0 },
+                db.stats.rdb_changes_since_last_save.load(Ordering::Relaxed),
                 lastsave,
                 aof_enabled,
             ),
@@ -2520,19 +2593,27 @@ fn info(parser: &mut ParsedCommand, db: &Database) -> Response {
             write!(
                 out,
                 "# Stats\r\n\
-                 total_connections_received:0\r\n\
-                 total_commands_processed:0\r\n\
-                 instantaneous_ops_per_sec:0\r\n\
-                 rejected_connections:0\r\n\
-                 expired_keys:0\r\n\
-                 evicted_keys:0\r\n\
-                 keyspace_hits:0\r\n\
-                 keyspace_misses:0\r\n\
+                 total_connections_received:{}\r\n\
+                 total_commands_processed:{}\r\n\
+                 instantaneous_ops_per_sec:{}\r\n\
+                 rejected_connections:{}\r\n\
+                 expired_keys:{}\r\n\
+                 evicted_keys:{}\r\n\
+                 keyspace_hits:{}\r\n\
+                 keyspace_misses:{}\r\n\
                  pubsub_channels:{}\r\n\
                  pubsub_patterns:{}\r\n\
                  latest_fork_usec:0\r\n\
                  \r\n\
                  ",
+                db.stats.total_connections_received.load(Ordering::Relaxed),
+                db.stats.total_commands_processed.load(Ordering::Relaxed),
+                db.stats.instantaneous_ops_per_sec(),
+                db.stats.rejected_connections.load(Ordering::Relaxed),
+                db.stats.expired_keys.load(Ordering::Relaxed),
+                db.stats.evicted_keys.load(Ordering::Relaxed),
+                db.stats.keyspace_hits.load(Ordering::Relaxed),
+                db.stats.keyspace_misses.load(Ordering::Relaxed),
                 pubsub_channels,
                 pubsub_patterns,
             ),
@@ -2541,35 +2622,33 @@ fn info(parser: &mut ParsedCommand, db: &Database) -> Response {
     }
 
     if section == "default" || show_all || section == "replication" {
+        let role = if db.cluster.enabled {
+            db.cluster.role.to_string()
+        } else if db.config.slaveof.is_some() {
+            "slave".to_owned()
+        } else {
+            "master".to_owned()
+        };
         try_validate!(
             write!(
                 out,
                 "# Replication\r\n\
-                 role:master\r\n\
+                 role:{}\r\n\
                  connected_slaves:0\r\n\
+                 master_failover_state:no-failover\r\n\
+                 master_replid:{}\r\n\
+                 master_replid2:0000000000000000000000000000000000000000\r\n\
+                 master_repl_offset:0\r\n\
+                 second_repl_offset:-1\r\n\
+                 repl_backlog_active:0\r\n\
+                 repl_backlog_size:{}\r\n\
+                 repl_backlog_first_byte_offset:0\r\n\
+                 repl_backlog_histlen:0\r\n\
                  \r\n\
-                 "
-            ),
-            "ERR unexpected"
-        );
-    }
-
-    if show_all || section == "replication_detail" {
-        try_validate!(
-            write!(
-                out,
-                "# Replication Detail\r\n\
-                 master_host:\r\n\
-                 master_port:0\r\n\
-                 master_link_status:down\r\n\
-                 master_last_io_seconds_ago:0\r\n\
-                 master_sync_in_progress:0\r\n\
-                 master_sync_left_bytes:0\r\n\
-                 master_sync_last_io_seconds_ago:0\r\n\
-                 master_link_down_since_seconds:0\r\n\
-                 slaveXXX:\r\n\
-                 \r\n\
-                 "
+                 ",
+                role,
+                db.run_id,
+                db.config.repl_backlog_size,
             ),
             "ERR unexpected"
         );
@@ -2607,15 +2686,13 @@ fn info(parser: &mut ParsedCommand, db: &Database) -> Response {
     if section == "default" || show_all || section == "keyspace" {
         try_validate!(write!(out, "# Keyspace\r\n"), "ERR unexpected");
         for dbindex in 0..(db.config.databases as usize) {
-            let dbsize = db.dbsize(dbindex);
-            if dbsize > 0 {
+            let (keys, expires, avg_ttl) = db.aggregated_keyspace(dbindex);
+            if keys > 0 {
                 try_validate!(
                     write!(
                         out,
-                        "db{}:keys={};expires={};avg_ttl=0\r\n",
-                        dbindex,
-                        dbsize,
-                        db.db_expire_size(dbindex)
+                        "db{}:keys={};expires={};avg_ttl={}\r\n",
+                        dbindex, keys, expires, avg_ttl
                     ),
                     "ERR unexpected"
                 );
@@ -9812,6 +9889,12 @@ fn execute_command(
         .flags
         .contains(CommandFlags::READONLY);
 
+    // Server-wide statistics (shared across shards, read by INFO).
+    db.stats.record_command();
+    if *write {
+        db.stats.record_write();
+    }
+
     if db.config.requirepass.is_none() {
         client.auth = true;
     }
@@ -13256,10 +13339,31 @@ mod test_command {
     fn info() {
         let mut db = Database::new(Config::new(Logger::new(Level::Warning)));
         let mut client = Client::mock();
+        // Generate some traffic so the INFO stats reflect real activity.
+        assert_eq!(
+            command(parser!(b"set key 1"), &mut db, &mut client).unwrap(),
+            Response::Status("OK".to_owned())
+        );
+        assert_eq!(
+            command(parser!(b"get key"), &mut db, &mut client).unwrap(),
+            Response::Data(b"1".to_vec())
+        );
+        assert_eq!(
+            command(parser!(b"get missing"), &mut db, &mut client).unwrap(),
+            Response::Nil
+        );
         if let Response::Data(d) = command(parser!(b"info"), &mut db, &mut client).unwrap() {
             let s = from_utf8(&*d).unwrap();
             assert!(s.contains("rudis_git_sha1"));
             assert!(s.contains("rudis_git_dirty"));
+            assert!(s.contains("redis_version:"));
+            assert!(s.contains("role:master"));
+            // 3 commands + the INFO call itself.
+            assert!(s.contains("total_commands_processed:4"));
+            assert!(s.contains("rdb_changes_since_last_save:1"));
+            assert!(s.contains("keyspace_hits:1"));
+            assert!(s.contains("keyspace_misses:1"));
+            assert!(s.contains("db0:keys=1;expires=0;avg_ttl=0"));
         } else {
             panic!("Expected data");
         }

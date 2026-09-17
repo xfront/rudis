@@ -416,6 +416,9 @@ impl Client {
             }
         }
 
+        // The connection is over: release the connected-clients counter.
+        self.db.stats.record_connection_closed();
+
         {
             // Pubsub state is on shard 0
             let mut shard = match self.db.shard_write(0, 0) {
@@ -447,6 +450,8 @@ macro_rules! handle_listener {
                 match stream {
                     Ok(stream) => {
                         sendlog!(sender, Verbose, "Accepted connection to {:?}", stream).unwrap();
+                        // Server-wide statistics are shared across shards.
+                        db.stats.record_connection_opened();
                         let db1 = db.clone();
                         let mysender = sender.clone();
                         let id = next_id.fetch_add(1, Ordering::Relaxed);
@@ -492,9 +497,12 @@ macro_rules! handle_listener {
 impl Server {
     /// Creates a new server
     pub fn new(config: Config) -> Server {
-        let sharded_db = ShardedDatabase::new(&config);
+        let sharded_db = Arc::new(ShardedDatabase::new(&config));
+        // Wire each shard back to the sharded database so admin commands
+        // (INFO/DBSIZE) can aggregate keyspace data across shards.
+        sharded_db.init_shard_links();
         Server {
-            db: Arc::new(sharded_db),
+            db: sharded_db,
             config,
             listener_channels: Vec::new(),
             listener_threads: Vec::new(),
