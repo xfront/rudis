@@ -9199,6 +9199,12 @@ fn cf_command(parser: &mut ParsedCommand, db: &mut Database, dbindex: usize) -> 
     }
 }
 
+/// Formats a t-digest floating-point result the way RESP2 expects:
+/// "inf" / "-inf" / "nan" (lowercase), plain decimal otherwise.
+fn format_tdigest_double(v: f64) -> String {
+    if v.is_nan() { "nan".to_owned() } else { v.to_string() }
+}
+
 fn tdigest_command(parser: &mut ParsedCommand, db: &mut Database, dbindex: usize) -> Response {
     validate_arguments_gte!(parser, 2);
     // Dotted module syntax (TDIGEST.ADD key ...) is reshaped into the
@@ -9388,6 +9394,124 @@ fn tdigest_command(parser: &mut ParsedCommand, db: &mut Database, dbindex: usize
             db.get_or_create(dbindex, &dest_key).set_tdigest(merged);
             db.key_updated(dbindex, &dest_key);
             Response::Status("OK".to_owned())
+        }
+        "rank" => {
+            // TDIGEST.RANK key value [value ...]
+            if parser.argv.len() < 4 {
+                return Response::Error("ERR wrong number of arguments for 'tdigest.rank' command".to_owned());
+            }
+            let key = match parser.get_vec(2) { Ok(k) => k, Err(_) => return Response::Error("ERR syntax error".to_owned()) };
+            match db.get(dbindex, &key) {
+                Some(val) => {
+                    let mut results = Vec::new();
+                    for i in 3..parser.argv.len() {
+                        let v = match parser.get_f64(i) { Ok(v) => v, Err(_) => return Response::Error("ERR value is not a valid float".to_owned()) };
+                        if v.is_nan() {
+                            return Response::Error("ERR NaN value".to_owned());
+                        }
+                        match val.tdigest_rank(v) {
+                            Ok(r) => results.push(Response::Integer(r)),
+                            Err(e) => return Response::Error(e.to_string()),
+                        }
+                    }
+                    Response::Array(results)
+                }
+                None => Response::Error("ERR not found".to_owned()),
+            }
+        }
+        "revrank" => {
+            // TDIGEST.REVRANK key value [value ...]
+            if parser.argv.len() < 4 {
+                return Response::Error("ERR wrong number of arguments for 'tdigest.revrank' command".to_owned());
+            }
+            let key = match parser.get_vec(2) { Ok(k) => k, Err(_) => return Response::Error("ERR syntax error".to_owned()) };
+            match db.get(dbindex, &key) {
+                Some(val) => {
+                    let mut results = Vec::new();
+                    for i in 3..parser.argv.len() {
+                        let v = match parser.get_f64(i) { Ok(v) => v, Err(_) => return Response::Error("ERR value is not a valid float".to_owned()) };
+                        if v.is_nan() {
+                            return Response::Error("ERR NaN value".to_owned());
+                        }
+                        match val.tdigest_revrank(v) {
+                            Ok(r) => results.push(Response::Integer(r)),
+                            Err(e) => return Response::Error(e.to_string()),
+                        }
+                    }
+                    Response::Array(results)
+                }
+                None => Response::Error("ERR not found".to_owned()),
+            }
+        }
+        "byrank" => {
+            // TDIGEST.BYRANK key rank [rank ...]
+            if parser.argv.len() < 4 {
+                return Response::Error("ERR wrong number of arguments for 'tdigest.byrank' command".to_owned());
+            }
+            let key = match parser.get_vec(2) { Ok(k) => k, Err(_) => return Response::Error("ERR syntax error".to_owned()) };
+            match db.get(dbindex, &key) {
+                Some(val) => {
+                    let mut results = Vec::new();
+                    for i in 3..parser.argv.len() {
+                        let r = match parser.get_f64(i) { Ok(v) => v, Err(_) => return Response::Error("ERR value is not a valid float".to_owned()) };
+                        if r.is_nan() {
+                            return Response::Error("ERR NaN rank".to_owned());
+                        }
+                        match val.tdigest_byrank(r) {
+                            Ok(v) => results.push(Response::Data(format_tdigest_double(v).into_bytes())),
+                            Err(e) => return Response::Error(e.to_string()),
+                        }
+                    }
+                    Response::Array(results)
+                }
+                None => Response::Error("ERR not found".to_owned()),
+            }
+        }
+        "byrevrank" => {
+            // TDIGEST.BYREVRANK key reverse_rank [reverse_rank ...]
+            if parser.argv.len() < 4 {
+                return Response::Error("ERR wrong number of arguments for 'tdigest.byrevrank' command".to_owned());
+            }
+            let key = match parser.get_vec(2) { Ok(k) => k, Err(_) => return Response::Error("ERR syntax error".to_owned()) };
+            match db.get(dbindex, &key) {
+                Some(val) => {
+                    let mut results = Vec::new();
+                    for i in 3..parser.argv.len() {
+                        let r = match parser.get_f64(i) { Ok(v) => v, Err(_) => return Response::Error("ERR value is not a valid float".to_owned()) };
+                        if r.is_nan() {
+                            return Response::Error("ERR NaN rank".to_owned());
+                        }
+                        match val.tdigest_byrevrank(r) {
+                            Ok(v) => results.push(Response::Data(format_tdigest_double(v).into_bytes())),
+                            Err(e) => return Response::Error(e.to_string()),
+                        }
+                    }
+                    Response::Array(results)
+                }
+                None => Response::Error("ERR not found".to_owned()),
+            }
+        }
+        "trimmed_mean" => {
+            // TDIGEST.TRIMMED_MEAN key low_cut_quantile high_cut_quantile
+            if parser.argv.len() != 5 {
+                return Response::Error("ERR wrong number of arguments for 'tdigest.trimmed_mean' command".to_owned());
+            }
+            let key = match parser.get_vec(2) { Ok(k) => k, Err(_) => return Response::Error("ERR syntax error".to_owned()) };
+            let low = match parser.get_f64(3) { Ok(v) => v, Err(_) => return Response::Error("ERR value is not a valid float".to_owned()) };
+            let high = match parser.get_f64(4) { Ok(v) => v, Err(_) => return Response::Error("ERR value is not a valid float".to_owned()) };
+            if !(0.0..=1.0).contains(&low) || !(0.0..=1.0).contains(&high) {
+                return Response::Error("ERR quantile should be in [0..1]".to_owned());
+            }
+            if low >= high {
+                return Response::Error("ERR low_cut_quantile should be lower than high_cut_quantile".to_owned());
+            }
+            match db.get(dbindex, &key) {
+                Some(val) => match val.tdigest_trimmed_mean(low, high) {
+                    Ok(m) => Response::Data(format_tdigest_double(m).into_bytes()),
+                    Err(e) => Response::Error(e.to_string()),
+                },
+                None => Response::Error("ERR not found".to_owned()),
+            }
         }
         _ => Response::Error(format!("ERR Unknown subcommand '{}'", subcommand)),
     }

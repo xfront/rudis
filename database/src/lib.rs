@@ -2122,6 +2122,41 @@ impl Value {
         }
     }
 
+    pub fn tdigest_rank(&self, v: f64) -> Result<i64, OperationError> {
+        match self {
+            Value::TDigest(td) => Ok(td.rank(v)),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
+    pub fn tdigest_revrank(&self, v: f64) -> Result<i64, OperationError> {
+        match self {
+            Value::TDigest(td) => Ok(td.revrank(v)),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
+    pub fn tdigest_byrank(&self, r: f64) -> Result<f64, OperationError> {
+        match self {
+            Value::TDigest(td) => Ok(td.value_at_rank(r)),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
+    pub fn tdigest_byrevrank(&self, r: f64) -> Result<f64, OperationError> {
+        match self {
+            Value::TDigest(td) => Ok(td.value_at_revrank(r)),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
+    pub fn tdigest_trimmed_mean(&self, low: f64, high: f64) -> Result<f64, OperationError> {
+        match self {
+            Value::TDigest(td) => Ok(td.trimmed_mean(low, high)),
+            _ => Err(OperationError::WrongTypeError),
+        }
+    }
+
     // --- TopK methods ---
 
     pub fn set_topk(&mut self, tk: TopK) {

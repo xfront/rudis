@@ -411,6 +411,106 @@ impl TDigest {
         if other.max > self.max { self.max = other.max; }
         self.compress();
     }
+
+    /// Estimates the 0-based rank of `value`: the number of observations
+    /// smaller than `value` plus half the number of observations equal to
+    /// it. Returns -1 when the value is below the smallest observation, n
+    /// when above the largest, and -2 for every input when empty.
+    pub fn rank(&self, value: f64) -> i64 {
+        if self.centroids.is_empty() { return -2; }
+        if value < self.min { return -1; }
+        let mut sorted = self.centroids.clone();
+        sorted.sort_by(|a, b| a.mean.partial_cmp(&b.mean).unwrap());
+        let mut smaller = 0.0;
+        let mut equal = 0.0;
+        for c in &sorted {
+            if c.mean < value {
+                smaller += c.count;
+            } else if c.mean == value {
+                equal += c.count;
+            } else {
+                break;
+            }
+        }
+        (smaller + equal * 0.5).floor() as i64
+    }
+
+    /// Reverse rank: the number of observations greater than `value` plus
+    /// half the observations equal to it. Returns -1 above the largest
+    /// observation, n below the smallest, and -2 for every input when
+    /// empty.
+    pub fn revrank(&self, value: f64) -> i64 {
+        if self.centroids.is_empty() { return -2; }
+        if value > self.max { return -1; }
+        if value < self.min { return self.count as i64; }
+        let mut sorted = self.centroids.clone();
+        sorted.sort_by(|a, b| a.mean.partial_cmp(&b.mean).unwrap());
+        let mut greater = 0.0;
+        let mut equal = 0.0;
+        for c in &sorted {
+            if c.mean > value {
+                greater += c.count;
+            } else if c.mean == value {
+                equal += c.count;
+            }
+        }
+        (greater + equal * 0.5).floor() as i64
+    }
+
+    /// Estimates the value occupying `rank` (0-based ascending). Ranks 0
+    /// and n-1 are answered exactly with min/max; ranks >= n map to +inf,
+    /// negative ranks to -inf, and an empty sketch answers nan.
+    pub fn value_at_rank(&self, rank: f64) -> f64 {
+        if self.centroids.is_empty() { return f64::NAN; }
+        let n = self.count as i64;
+        let r = rank.round() as i64;
+        if r < 0 { return f64::NEG_INFINITY; }
+        if r >= n { return f64::INFINITY; }
+        if r == 0 { return self.min; }
+        if r == n - 1 { return self.max; }
+        let target = r as f64;
+        let mut sorted = self.centroids.clone();
+        sorted.sort_by(|a, b| a.mean.partial_cmp(&b.mean).unwrap());
+        let mut cumulative = 0.0;
+        for c in &sorted {
+            if cumulative + c.count > target {
+                return c.mean;
+            }
+            cumulative += c.count;
+        }
+        self.max
+    }
+
+    /// Estimates the value occupying `revrank` (0-based descending):
+    /// revrank 0 is the largest observation and n-1 the smallest;
+    /// revranks >= n map to -inf, negative to +inf.
+    pub fn value_at_revrank(&self, revrank: f64) -> f64 {
+        if self.centroids.is_empty() { return f64::NAN; }
+        let n = self.count as i64;
+        let r = revrank.round() as i64;
+        if r < 0 { return f64::INFINITY; }
+        if r >= n { return f64::NEG_INFINITY; }
+        self.value_at_rank((n - 1 - r) as f64)
+    }
+
+    /// Mean of the observations inside the quantile window: observations
+    /// below the `low` cutoff and at or above the `high` cutoff are
+    /// excluded (cutoffs 0 / 1 disable the respective cut). nan when the
+    /// sketch is empty or nothing remains after cutting.
+    pub fn trimmed_mean(&self, low: f64, high: f64) -> f64 {
+        if self.centroids.is_empty() { return f64::NAN; }
+        let n = self.count as f64;
+        let v_low = if low <= 0.0 { f64::NEG_INFINITY } else { self.value_at_rank(low * n) };
+        let v_high = if high >= 1.0 { f64::INFINITY } else { self.value_at_rank(high * n) };
+        let (mut sum, mut weight) = (0.0, 0.0);
+        for c in &self.centroids {
+            if c.mean < v_low || c.mean >= v_high { continue; }
+            sum += c.mean * c.count;
+            weight += c.count;
+        }
+        if weight == 0.0 { return f64::NAN; }
+        sum / weight
+    }
 }
 
 // ============================================================================
@@ -593,5 +693,72 @@ mod test_bloom {
         for _ in 0..3 { topk.add(b"c", 1); }
         topk.add(b"d", 1);
         assert!(topk.query(b"a"));
+    }
+
+    // Official example: TDIGEST.ADD s 10 20 30 40 50 60
+    #[test]
+    fn test_tdigest_rank_unique() {
+        let mut td = TDigest::new(1000.0);
+        for v in [10.0, 20.0, 30.0, 40.0, 50.0, 60.0] {
+            td.add(v);
+        }
+        let expected = [-1i64, 0, 1, 2, 3, 4, 5, 6];
+        for (i, v) in [0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0].iter().enumerate() {
+            assert_eq!(td.rank(*v), expected[i], "rank({})", v);
+        }
+        let expected_rev = [6i64, 5, 4, 3, 2, 1, 0, -1];
+        for (i, v) in [0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0].iter().enumerate() {
+            assert_eq!(td.revrank(*v), expected_rev[i], "revrank({})", v);
+        }
+    }
+
+    // Official example: TDIGEST.ADD s 10 10 10 10 20 20
+    #[test]
+    fn test_tdigest_rank_duplicates() {
+        let mut td = TDigest::new(1000.0);
+        for v in [10.0f64, 10.0, 10.0, 10.0, 20.0, 20.0] {
+            td.add(v);
+        }
+        assert_eq!(td.rank(10.0), 2);
+        assert_eq!(td.rank(20.0), 5);
+        assert_eq!(td.revrank(10.0), 4);
+        assert_eq!(td.revrank(20.0), 1);
+    }
+
+    // Official example: TDIGEST.ADD t 1 2 2 3 3 3 4 4 4 4 5 5 5 5 5
+    #[test]
+    fn test_tdigest_byrank() {
+        let mut td = TDigest::new(1000.0);
+        for v in [1.0f64, 2.0, 2.0, 3.0, 3.0, 3.0, 4.0, 4.0, 4.0, 4.0, 5.0, 5.0, 5.0, 5.0, 5.0] {
+            td.add(v);
+        }
+        let expected = [1.0f64, 2.0, 2.0, 3.0, 3.0, 3.0, 4.0, 4.0, 4.0, 4.0, 5.0, 5.0, 5.0, 5.0, 5.0];
+        for (i, r) in expected.iter().enumerate() {
+            assert_eq!(td.value_at_rank(i as f64), *r, "byrank({})", i);
+        }
+        assert_eq!(td.value_at_rank(15.0), f64::INFINITY);
+        assert_eq!(td.value_at_rank(-1.0), f64::NEG_INFINITY);
+        assert_eq!(td.value_at_revrank(0.0), 5.0);
+        assert_eq!(td.value_at_revrank(14.0), 1.0);
+        assert_eq!(td.value_at_revrank(15.0), f64::NEG_INFINITY);
+        assert_eq!(td.value_at_revrank(-1.0), f64::INFINITY);
+        let empty = TDigest::new(1000.0);
+        assert!(empty.value_at_rank(3.0).is_nan());
+        assert_eq!(empty.rank(1.0), -2);
+        assert_eq!(empty.revrank(1.0), -2);
+    }
+
+    // Official example: TDIGEST.ADD t 1 2 3 4 5 6 7 8 9 10
+    #[test]
+    fn test_tdigest_trimmed_mean() {
+        let mut td = TDigest::new(1000.0);
+        for v in 1..=10 {
+            td.add(v as f64);
+        }
+        assert_eq!(td.trimmed_mean(0.1, 0.6), 4.0);
+        assert_eq!(td.trimmed_mean(0.3, 0.9), 6.5);
+        assert_eq!(td.trimmed_mean(0.0, 1.0), 5.5);
+        let empty = TDigest::new(1000.0);
+        assert!(empty.trimmed_mean(0.0, 1.0).is_nan());
     }
 }
