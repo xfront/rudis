@@ -5,6 +5,7 @@ use std::{
     sync::atomic::Ordering,
     sync::mpsc::channel,
     sync::mpsc::Sender,
+    sync::Arc,
     thread,
     time::Duration,
     usize,
@@ -17,6 +18,7 @@ use database::cluster::{
     self, ClusterState, NodeFlags, NodeRole, SlotState,
     CLUSTER_SLOTS, NODE_ID_LEN,
 };
+use database::shard::ShardedDatabase;
 use database::{zset, Database, PubsubEvent, Value};
 use parser::{Argument, OwnedParsedCommand, ParsedCommand};
 use response::{Response, ResponseError};
@@ -90,20 +92,299 @@ macro_rules! try_validate {
     }};
 }
 
-macro_rules! get_values {
-    ($start: expr, $stop: expr, $parser: expr, $db: expr, $dbindex: expr, $default: expr) => {{
-        validate_arguments_gte!($parser, $start);
-        validate_arguments_gte!($parser, $stop);
-        let mut sets = Vec::with_capacity($parser.argv.len() - $start);
-        for i in $start..$stop {
-            let key = try_validate!($parser.get_vec(i), "Invalid key");
-            match $db.get($dbindex, &key) {
-                Some(e) => sets.push(e),
-                None => sets.push($default),
-            };
+/// Returns the sharded database plus the shard index this command was routed
+/// to (its lock is already held by the caller), when sharding is active.
+fn sharding(db: &Database) -> Option<(Arc<ShardedDatabase>, usize)> {
+    match &db.sharded {
+        Some((weak, my)) => weak.upgrade().map(|s| (s, *my)),
+        None => None,
+    }
+}
+
+/// Owned clones of the values under `keys`, read from whichever shard hosts
+/// each key (keys hosted by the caller's own shard are read through its
+/// already-locked `Database`). Missing keys yield `None`.
+fn fetch_all(db: &Database, dbindex: usize, keys: &[&[u8]]) -> Vec<Option<Value>> {
+    match sharding(db) {
+        Some((sharded, my)) => sharded
+            .read_values_except(dbindex, Some(my), keys)
+            .into_iter()
+            .zip(keys.iter())
+            .map(|(remote, key)| {
+                if sharded.is_own_shard(key, my) {
+                    db.get(dbindex, key).cloned()
+                } else {
+                    remote
+                }
+            })
+            .collect(),
+        None => keys.iter().map(|key| db.get(dbindex, key).cloned()).collect(),
+    }
+}
+
+/// Whether `key` exists on whichever shard hosts it. Uses a mutable read on
+/// the owning shard so that expired keys are lazily deleted (and counted).
+fn key_exists(db: &mut Database, dbindex: usize, key: &[u8]) -> bool {
+    match sharding(db) {
+        Some((sharded, my)) => {
+            if sharded.is_own_shard(key, my) {
+                db.get_mut(dbindex, key).is_some()
+            } else {
+                sharded.read_with_ttl(dbindex, key).is_some()
+            }
         }
-        sets
-    }};
+        None => db.get_mut(dbindex, key).is_some(),
+    }
+}
+
+/// Reads the value under `key` plus its expiration from whichever shard hosts
+/// it. The expiration is an absolute timestamp in milliseconds.
+fn cross_fetch(db: &mut Database, dbindex: usize, key: &[u8]) -> Option<(Value, Option<i64>)> {
+    match sharding(db) {
+        Some((sharded, my)) => {
+            if sharded.is_own_shard(key, my) {
+                let value = db.get(dbindex, key).cloned()?;
+                let ttl = db.get_msexpiration(dbindex, key).copied();
+                Some((value, ttl))
+            } else {
+                sharded.read_with_ttl(dbindex, key)
+            }
+        }
+        None => {
+            let value = db.get(dbindex, key).cloned()?;
+            let ttl = db.get_msexpiration(dbindex, key).copied();
+            Some((value, ttl))
+        }
+    }
+}
+
+/// Writes `value` (replacing any previous value and expiration) under `key`
+/// on whichever shard hosts it. Notifies key watchers either way.
+fn cross_store(db: &mut Database, dbindex: usize, key: &[u8], value: Value, msexpiration: Option<i64>) {
+    match sharding(db) {
+        Some((sharded, my)) => {
+            if sharded.is_own_shard(key, my) {
+                db.remove_msexpiration(dbindex, key);
+                *db.get_or_create(dbindex, key) = value;
+                if let Some(exp) = msexpiration {
+                    db.set_msexpiration(dbindex, key.to_vec(), exp);
+                }
+                db.key_updated(dbindex, key);
+            } else {
+                sharded.write_value(dbindex, Some(my), key, value, msexpiration);
+            }
+        }
+        None => {
+            db.remove_msexpiration(dbindex, key);
+            *db.get_or_create(dbindex, key) = value;
+            if let Some(exp) = msexpiration {
+                db.set_msexpiration(dbindex, key.to_vec(), exp);
+            }
+            db.key_updated(dbindex, key);
+        }
+    }
+}
+
+/// Removes `key` (and its expiration) from whichever shard hosts it.
+/// Returns whether the key existed. Notifies key watchers on removal.
+fn cross_remove(db: &mut Database, dbindex: usize, key: &[u8]) -> bool {
+    match sharding(db) {
+        Some((sharded, my)) => {
+            if sharded.is_own_shard(key, my) {
+                let existed = db.remove(dbindex, key).is_some();
+                if existed {
+                    db.key_updated(dbindex, key);
+                }
+                existed
+            } else {
+                sharded.remove_key(dbindex, Some(my), key)
+            }
+        }
+        None => {
+            let existed = db.remove(dbindex, key).is_some();
+            if existed {
+                db.key_updated(dbindex, key);
+            }
+            existed
+        }
+    }
+}
+
+/// Removes `member` from the set under `key` (wherever hosted). Returns
+/// whether the member was present.
+fn srem_cross(db: &mut Database, dbindex: usize, key: &[u8], member: &[u8]) -> Result<bool, String> {
+    match sharding(db) {
+        Some((sharded, my)) => {
+            if sharded.is_own_shard(key, my) {
+                match db.get_mut(dbindex, key) {
+                    Some(s) => s.srem(member).map_err(|e| e.to_string()),
+                    None => Ok(false),
+                }
+            } else {
+                let results = sharded.with_key_shards(dbindex, Some(my), &[key], |shard, _| {
+                    match shard.db.get_mut(dbindex, key) {
+                        Some(s) => s.srem(member).map_err(|e| e.to_string()),
+                        None => Ok(false),
+                    }
+                });
+                results.into_iter().next().map(|(_, r)| r).unwrap_or(Ok(false))
+            }
+        }
+        None => match db.get_mut(dbindex, key) {
+            Some(s) => s.srem(member).map_err(|e| e.to_string()),
+            None => Ok(false),
+        },
+    }
+}
+
+/// Adds `member` to the set under `key` (wherever hosted), creating it.
+fn sadd_cross(db: &mut Database, dbindex: usize, key: &[u8], member: Vec<u8>) -> Result<(), String> {
+    let max_intset = db.config.set_max_intset_entries;
+    match sharding(db) {
+        Some((sharded, my)) => {
+            if sharded.is_own_shard(key, my) {
+                match db.get_or_create(dbindex, key).sadd(member, max_intset) {
+                    Ok(_) => Ok(()),
+                    Err(e) => Err(e.to_string()),
+                }
+            } else {
+                let results = sharded.with_key_shards(dbindex, Some(my), &[key], |shard, _| {
+                    match shard
+                        .db
+                        .get_or_create(dbindex, key)
+                        .sadd(member.clone(), max_intset)
+                    {
+                        Ok(_) => Ok(()),
+                        Err(e) => Err(e.to_string()),
+                    }
+                });
+                results.into_iter().next().map(|(_, r)| r).unwrap_or(Ok(()))
+            }
+        }
+        None => match db.get_or_create(dbindex, key).sadd(member, max_intset) {
+            Ok(_) => Ok(()),
+            Err(e) => Err(e.to_string()),
+        },
+    }
+}
+
+/// Pops one element from the list under `key` (wherever hosted).
+fn pop_from_list(
+    db: &mut Database,
+    dbindex: usize,
+    key: &[u8],
+    right: bool,
+) -> Result<Option<Vec<u8>>, String> {
+    match sharding(db) {
+        Some((sharded, my)) => {
+            if sharded.is_own_shard(key, my) {
+                match db.get_mut(dbindex, key) {
+                    Some(list) => {
+                        if list.llen().is_err() {
+                            return Err("WRONGTYPE Source is not a list".to_owned());
+                        }
+                        list.pop(right).map_err(|e| e.to_string())
+                    }
+                    None => Ok(None),
+                }
+            } else {
+                let results = sharded.with_key_shards(dbindex, Some(my), &[key], |shard, _| {
+                    match shard.db.get_mut(dbindex, key) {
+                        Some(list) => {
+                            if list.llen().is_err() {
+                                Err("WRONGTYPE Source is not a list".to_owned())
+                            } else {
+                                list.pop(right).map_err(|e| e.to_string())
+                            }
+                        }
+                        None => Ok(None),
+                    }
+                });
+                results.into_iter().next().map(|(_, r)| r).unwrap_or(Ok(None))
+            }
+        }
+        None => match db.get_mut(dbindex, key) {
+            Some(list) => {
+                if list.llen().is_err() {
+                    return Err("WRONGTYPE Source is not a list".to_owned());
+                }
+                list.pop(right).map_err(|e| e.to_string())
+            }
+            None => Ok(None),
+        },
+    }
+}
+
+/// Pushes `element` onto the list under `key` (wherever hosted), creating
+/// the key when missing.
+fn push_to_list(
+    db: &mut Database,
+    dbindex: usize,
+    key: &[u8],
+    element: Vec<u8>,
+    right: bool,
+) -> Result<(), String> {
+    match sharding(db) {
+        Some((sharded, my)) => {
+            if sharded.is_own_shard(key, my) {
+                db.get_or_create(dbindex, key)
+                    .push(element, right)
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+            } else {
+                let results = sharded.with_key_shards(dbindex, Some(my), &[key], |shard, _| {
+                    shard.db
+                        .get_or_create(dbindex, key)
+                        .push(element.clone(), right)
+                        .map(|_| ())
+                        .map_err(|e| e.to_string())
+                });
+                results.into_iter().next().map(|(_, r)| r).unwrap_or(Ok(()))
+            }
+        }
+        None => db
+            .get_or_create(dbindex, key)
+            .push(element, right)
+            .map(|_| ())
+            .map_err(|e| e.to_string()),
+    }
+}
+
+/// Shared body of RPOPLPUSH/LMOVE: pops from `source` and pushes to
+/// `destination`, each on whichever shard hosts it. Lock ordering (min-shard
+/// routing) makes this deadlock-free; the two steps are not atomic across
+/// shards.
+fn generic_pop_push_cross(
+    db: &mut Database,
+    dbindex: usize,
+    source: &[u8],
+    destination: &[u8],
+    src_right: bool,
+    dst_right: bool,
+) -> Response {
+    // WRONGTYPE check on the destination (wherever it lives)
+    {
+        let vals = fetch_all(db, dbindex, &[destination]);
+        if let Some(Some(e)) = vals.into_iter().next() {
+            if e.llen().is_err() {
+                return Response::Error("WRONGTYPE Destination is not a list".to_owned());
+            }
+        }
+    }
+
+    let el = match pop_from_list(db, dbindex, source, src_right) {
+        Ok(Some(el)) => el,
+        Ok(None) => return Response::Nil,
+        Err(err) => return Response::Error(err),
+    };
+
+    if let Err(err) = push_to_list(db, dbindex, destination, el.clone(), dst_right) {
+        return Response::Error(err);
+    }
+
+    db.key_updated(dbindex, source);
+    db.key_updated(dbindex, destination);
+    Response::Data(el)
 }
 
 fn generic_set(
@@ -114,6 +395,7 @@ fn generic_set(
     nx: bool,
     xx: bool,
     expiration: Option<i64>,
+    keepttl: bool,
 ) -> Result<bool, Response> {
     if nx && db.get(dbindex, &key).is_some() {
         return Ok(false);
@@ -129,6 +411,9 @@ fn generic_set(
 
             if let Some(msexp) = expiration {
                 db.set_msexpiration(dbindex, key, msexp + mstime());
+            } else if !keepttl {
+                // Plain SET (no EX/PX/KEEPTTL) clears any previous TTL.
+                db.remove_msexpiration(dbindex, &key);
             }
 
             Ok(true)
@@ -144,6 +429,7 @@ fn set(parser: &mut ParsedCommand, db: &mut Database, dbindex: usize) -> Respons
     let mut nx = false;
     let mut xx = false;
     let mut expiration = None;
+    let mut keepttl = false;
     let mut get_old = false;
     let mut skip = false;
     for i in 3..parser.argv.len() {
@@ -156,6 +442,7 @@ fn set(parser: &mut ParsedCommand, db: &mut Database, dbindex: usize) -> Respons
             "nx" => nx = true,
             "xx" => xx = true,
             "get" => get_old = true,
+            "keepttl" => keepttl = true,
             "px" => {
                 let px = try_validate!(parser.get_i64(i + 1), "ERR syntax error");
                 expiration = Some(px);
@@ -168,6 +455,9 @@ fn set(parser: &mut ParsedCommand, db: &mut Database, dbindex: usize) -> Respons
             }
             _ => return Response::Error("ERR syntax error".to_owned()),
         }
+    }
+    if keepttl && expiration.is_some() {
+        return Response::Error("ERR syntax error".to_owned());
     }
 
     // GET option: return old value before SET
@@ -183,7 +473,7 @@ fn set(parser: &mut ParsedCommand, db: &mut Database, dbindex: usize) -> Respons
         None
     };
 
-    match generic_set(db, dbindex, key, val, nx, xx, expiration) {
+    match generic_set(db, dbindex, key, val, nx, xx, expiration, keepttl) {
         Ok(updated) => {
             if get_old {
                 // With GET, return old value regardless of NX/XX
@@ -202,7 +492,7 @@ fn setnx(parser: &mut ParsedCommand, db: &mut Database, dbindex: usize) -> Respo
     validate_arguments_exact!(parser, 3);
     let key = try_validate!(parser.get_vec(1), "ERR syntax error");
     let val = try_validate!(parser.get_vec(2), "ERR syntax error");
-    match generic_set(db, dbindex, key, val, true, false, None) {
+    match generic_set(db, dbindex, key, val, true, false, None, false) {
         Ok(updated) => Response::Integer(if updated { 1 } else { 0 }),
         Err(r) => r,
     }
@@ -214,7 +504,7 @@ fn setex(parser: &mut ParsedCommand, db: &mut Database, dbindex: usize) -> Respo
     let exp = try_validate!(parser.get_i64(2), "ERR syntax error");
     validate!(exp >= 0, "ERR invalid expire time");
     let val = try_validate!(parser.get_vec(3), "ERR syntax error");
-    match generic_set(db, dbindex, key, val, false, false, Some(exp * 1000)) {
+    match generic_set(db, dbindex, key, val, false, false, Some(exp * 1000), false) {
         Ok(_) => Response::Status("OK".to_owned()),
         Err(r) => r,
     }
@@ -226,19 +516,22 @@ fn psetex(parser: &mut ParsedCommand, db: &mut Database, dbindex: usize) -> Resp
     let exp = try_validate!(parser.get_i64(2), "ERR syntax error");
     validate!(exp >= 0, "ERR invalid expire time");
     let val = try_validate!(parser.get_vec(3), "ERR syntax error");
-    match generic_set(db, dbindex, key, val, false, false, Some(exp)) {
+    match generic_set(db, dbindex, key, val, false, false, Some(exp), false) {
         Ok(_) => Response::Status("OK".to_owned()),
         Err(r) => r,
     }
 }
 
 fn exists(parser: &mut ParsedCommand, db: &mut Database, dbindex: usize) -> Response {
-    validate_arguments_exact!(parser, 2);
-    let key = try_validate!(parser.get_vec(1), "Invalid key");
-    Response::Integer(match db.get(dbindex, &key) {
-        Some(_) => 1,
-        None => 0,
-    })
+    validate!(parser.argv.len() >= 2, "Wrong number of parameters");
+    let mut count = 0i64;
+    for i in 1..parser.argv.len() {
+        let key = try_validate!(parser.get_vec(i), "Invalid key");
+        if key_exists(db, dbindex, &key) {
+            count += 1;
+        }
+    }
+    Response::Integer(count)
 }
 
 fn del(parser: &mut ParsedCommand, db: &mut Database, dbindex: usize) -> Response {
@@ -246,9 +539,8 @@ fn del(parser: &mut ParsedCommand, db: &mut Database, dbindex: usize) -> Respons
     let mut c = 0;
     for i in 1..parser.argv.len() {
         let key = try_validate!(parser.get_vec(i), "Invalid key");
-        if db.remove(dbindex, &key).is_some() {
+        if cross_remove(db, dbindex, &key) {
             c += 1;
-            db.key_updated(dbindex, &key);
         }
     }
 
@@ -437,6 +729,13 @@ fn pexpireat(parser: &mut ParsedCommand, db: &mut Database, dbindex: usize) -> R
 
 fn flushdb(parser: &mut ParsedCommand, db: &mut Database, dbindex: usize) -> Response {
     validate_arguments_exact!(parser, 1);
+    // The command runs on one shard: clear this database index on every other
+    // shard too, then clear our own (our lock is already held by the caller).
+    if let Some((weak, my_shard_idx)) = &db.sharded {
+        if let Some(sharded) = weak.upgrade() {
+            sharded.clear_db_except(dbindex, Some(*my_shard_idx));
+        }
+    }
     db.clear(dbindex);
 
     Response::Status("OK".to_owned())
@@ -499,6 +798,15 @@ fn dbtype(parser: &mut ParsedCommand, db: &Database, dbindex: usize) -> Response
 
 fn flushall(parser: &mut ParsedCommand, db: &mut Database, _: usize) -> Response {
     validate_arguments_exact!(parser, 1);
+    // The command runs on one shard: clear every logical database on every
+    // other shard too, then clear our own (our lock is already held by the
+    // caller). Standalone databases have no sharded link and just clear
+    // themselves.
+    if let Some((weak, my_shard_idx)) = &db.sharded {
+        if let Some(sharded) = weak.upgrade() {
+            sharded.clearall_except(Some(*my_shard_idx));
+        }
+    }
     db.clearall();
 
     Response::Status("OK".to_owned())
@@ -552,11 +860,22 @@ fn get(parser: &mut ParsedCommand, db: &Database, dbindex: usize) -> Response {
 
 fn mget(parser: &mut ParsedCommand, db: &Database, dbindex: usize) -> Response {
     validate!(parser.argv.len() >= 2, "Wrong number of parameters");
-    let mut responses = Vec::with_capacity(parser.argv.len() - 1);
+    let mut keys = Vec::with_capacity(parser.argv.len() - 1);
     for i in 1..parser.argv.len() {
-        let key = try_validate!(parser.get_vec(i), "Invalid key");
-        responses.push(generic_get(db, dbindex, key, false));
+        keys.push(try_validate!(parser.get_vec(i), "Invalid key"));
     }
+    let refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+    // Non-string values read as Nil, like generic_get with err_on_wrongtype.
+    let responses = fetch_all(db, dbindex, &refs)
+        .into_iter()
+        .map(|v| match v {
+            Some(value) => match value.get() {
+                Ok(r) => Response::Data(r),
+                Err(_) => Response::Nil,
+            },
+            None => Response::Nil,
+        })
+        .collect();
     Response::Array(responses)
 }
 
@@ -743,13 +1062,13 @@ fn pfcount(parser: &ParsedCommand, db: &Database, dbindex: usize) -> Response {
             None => 0,
         })
     } else {
-        let mut values = Vec::with_capacity(parser.argv.len() - 1);
+        let mut keys = Vec::with_capacity(parser.argv.len() - 1);
         for i in 1..parser.argv.len() {
-            let key = try_validate!(parser.get_vec(i), "Invalid key");
-            if let Some(v) = db.get(dbindex, &key) {
-                values.push(v);
-            }
+            keys.push(try_validate!(parser.get_vec(i), "Invalid key"));
         }
+        let refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+        let owned = fetch_all(db, dbindex, &refs);
+        let values: Vec<&Value> = owned.iter().filter_map(|v| v.as_ref()).collect();
         let mut val = Value::Nil;
         if let Err(err) = val.pfmerge(values) {
             return Response::Error(err.to_string());
@@ -766,17 +1085,22 @@ fn pfmerge(parser: &ParsedCommand, db: &mut Database, dbindex: usize) -> Respons
     let key = try_validate!(parser.get_vec(1), "Invalid key");
 
     let (val, r) = {
+        // Destination's current value (wherever hosted), as a string to merge onto.
         let mut val = Value::Nil;
-        if let Some(v) = db.get(dbindex, &key) {
-            try_validate!(val.set(try_validate!(v.get(), "ERR")), "ERR"); // FIXME unnecesary clone
-        }
-        let mut values = Vec::with_capacity(parser.argv.len() - 2);
-        for i in 2..parser.argv.len() {
-            let key = try_validate!(parser.get_vec(i), "Invalid key");
-            if let Some(v) = db.get(dbindex, &key) {
-                values.push(v);
+        {
+            let dst_vals = fetch_all(db, dbindex, &[key.as_slice()]);
+            if let Some(Some(v)) = dst_vals.into_iter().next() {
+                try_validate!(val.set(try_validate!(v.get(), "ERR")), "ERR"); // FIXME unnecesary clone
             }
         }
+        // Sources (wherever hosted).
+        let mut src_keys = Vec::with_capacity(parser.argv.len() - 2);
+        for i in 2..parser.argv.len() {
+            src_keys.push(try_validate!(parser.get_vec(i), "Invalid key"));
+        }
+        let refs: Vec<&[u8]> = src_keys.iter().map(|k| k.as_slice()).collect();
+        let owned = fetch_all(db, dbindex, &refs);
+        let values: Vec<&Value> = owned.iter().filter_map(|v| v.as_ref()).collect();
 
         let r = match val.pfmerge(values) {
             Ok(()) => Response::Status("OK".to_owned()),
@@ -785,11 +1109,7 @@ fn pfmerge(parser: &ParsedCommand, db: &mut Database, dbindex: usize) -> Respons
         (val, r)
     };
 
-    {
-        let value = db.get_or_create(dbindex, &key);
-        *value = val;
-    }
-    db.key_updated(dbindex, &key);
+    cross_store(db, dbindex, &key, val, None);
     r
 }
 
@@ -845,10 +1165,24 @@ fn generic_pop(
     dbindex: usize,
     right: bool,
 ) -> Response {
-    validate_arguments_exact!(parser, 2);
+    validate_arguments_gte!(parser, 2);
+    validate_arguments_lte!(parser, 3);
     let key = try_validate!(parser.get_vec(1), "Invalid key");
-    let r = {
-        match db.get_mut(dbindex, &key) {
+    // Optional count argument (Redis >= 6.2): pops up to count elements.
+    let count: Option<usize> = if parser.argv.len() > 2 {
+        let c = try_validate!(
+            parser.get_i64(2),
+            "ERR value is not an integer or out of range"
+        );
+        if c < 0 {
+            return Response::Error("ERR value is out of range, must be positive".to_owned());
+        }
+        Some(c as usize)
+    } else {
+        None
+    };
+    let r = match count {
+        None => match db.get_mut(dbindex, &key) {
             Some(list) => match list.pop(right) {
                 Ok(el) => match el {
                     Some(val) => Response::Data(val),
@@ -857,6 +1191,19 @@ fn generic_pop(
                 Err(err) => Response::Error(err.to_string()),
             },
             None => Response::Nil,
+        },
+        Some(n) => {
+            let mut vals = Vec::new();
+            if let Some(list) = db.get_mut(dbindex, &key) {
+                for _ in 0..n {
+                    match list.pop(right) {
+                        Ok(Some(val)) => vals.push(val),
+                        Ok(None) => break,
+                        Err(err) => return Response::Error(err.to_string()),
+                    }
+                }
+            }
+            Response::Array(vals.into_iter().map(Response::Data).collect())
         }
     };
     db.key_updated(dbindex, &key);
@@ -917,7 +1264,7 @@ fn rpoplpush(parser: &mut ParsedCommand, db: &mut Database, dbindex: usize) -> R
     validate_arguments_exact!(parser, 3);
     let source = try_validate!(parser.get_vec(1), "Invalid source");
     let destination = try_validate!(parser.get_vec(2), "Invalid destination");
-    generic_rpoplpush(db, dbindex, &source, &destination)
+    generic_pop_push_cross(db, dbindex, &source, &destination, true, false)
 }
 
 fn brpoplpush(
@@ -1392,8 +1739,10 @@ fn smove(parser: &mut ParsedCommand, db: &mut Database, dbindex: usize) -> Respo
     let destination_key = try_validate!(parser.get_vec(2), "Invalid destination");
     let member = try_validate!(parser.get_vec(3), "Invalid member");
 
+    // WRONGTYPE check on the destination (wherever it lives)
     {
-        if let Some(e) = db.get(dbindex, &destination_key) {
+        let dst_vals = fetch_all(db, dbindex, &[destination_key.as_slice()]);
+        if let Some(Some(e)) = dst_vals.into_iter().next() {
             if !e.is_set() {
                 return Response::Error(
                     "WRONGTYPE Operation against a key holding the wrong \
@@ -1403,29 +1752,15 @@ fn smove(parser: &mut ParsedCommand, db: &mut Database, dbindex: usize) -> Respo
             }
         }
     }
-    {
-        let source = match db.get_mut(dbindex, &source_key) {
-            Some(s) => s,
-            None => return Response::Integer(0),
-        };
 
-        match source.srem(&member) {
-            Ok(removed) => {
-                if !removed {
-                    return Response::Integer(0);
-                }
-            }
-            Err(err) => return Response::Error(err.to_string()),
-        }
+    match srem_cross(db, dbindex, &source_key, &member) {
+        Ok(true) => {}
+        Ok(false) => return Response::Integer(0),
+        Err(err) => return Response::Error(err),
     }
 
-    let set_max_intset_entries = db.config.set_max_intset_entries;
-    {
-        let destination = db.get_or_create(dbindex, &destination_key);
-        match destination.sadd(member, set_max_intset_entries) {
-            Ok(_) => (),
-            Err(err) => panic!("Unexpected failure {}", err.to_string()),
-        }
+    if let Err(err) = sadd_cross(db, dbindex, &destination_key, member) {
+        panic!("Unexpected failure {}", err);
     }
 
     db.key_updated(dbindex, &source_key);
@@ -1450,14 +1785,24 @@ fn scard(parser: &mut ParsedCommand, db: &Database, dbindex: usize) -> Response 
 
 fn sdiff(parser: &mut ParsedCommand, db: &Database, dbindex: usize) -> Response {
     let key = try_validate!(parser.get_vec(1), "Invalid key");
-    let el = match db.get(dbindex, &key) {
+    let mut keys = Vec::with_capacity(parser.argv.len() - 1);
+    keys.push(key);
+    for i in 2..parser.argv.len() {
+        keys.push(try_validate!(parser.get_vec(i), "Invalid key"));
+    }
+    let refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+    let vals = fetch_all(db, dbindex, &refs);
+    let first = match vals[0].as_ref() {
         Some(e) => e,
         None => return Response::Array(vec![]),
     };
     let nil = Value::Nil;
-    let sets = get_values!(2, parser.argv.len(), parser, db, dbindex, &nil);
+    let sets: Vec<&Value> = vals[1..]
+        .iter()
+        .map(|v| v.as_ref().unwrap_or(&nil))
+        .collect();
 
-    match el.sdiff(&sets) {
+    match first.sdiff(&sets) {
         Ok(set) => Response::Array(
             set.iter()
                 .map(|x| Response::Data(x.clone()))
@@ -1472,34 +1817,54 @@ fn sdiffstore(parser: &mut ParsedCommand, db: &mut Database, dbindex: usize) -> 
     let destination_key = try_validate!(parser.get_vec(1), "Invalid destination");
     let set = {
         let key = try_validate!(parser.get_vec(2), "Invalid key");
-        let el = match db.get(dbindex, &key) {
+        let mut keys = Vec::with_capacity(parser.argv.len() - 2);
+        keys.push(key);
+        for i in 3..parser.argv.len() {
+            keys.push(try_validate!(parser.get_vec(i), "Invalid key"));
+        }
+        let refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+        let vals = fetch_all(db, dbindex, &refs);
+        let first = match vals[0].as_ref() {
             Some(e) => e,
             None => return Response::Integer(0),
         };
         let nil = Value::Nil;
-        let sets = get_values!(3, parser.argv.len(), parser, db, dbindex, &nil);
-        match el.sdiff(&sets) {
+        let sets: Vec<&Value> = vals[1..]
+            .iter()
+            .map(|v| v.as_ref().unwrap_or(&nil))
+            .collect();
+        match first.sdiff(&sets) {
             Ok(set) => set,
             Err(err) => return Response::Error(err.to_string()),
         }
     };
 
-    db.remove(dbindex, &destination_key);
     let r = set.len() as i64;
-    db.get_or_create(dbindex, &destination_key).create_set(set);
-    db.key_updated(dbindex, &destination_key);
+    let mut value = Value::Nil;
+    value.create_set(set);
+    cross_store(db, dbindex, &destination_key, value, None);
     Response::Integer(r)
 }
 
 fn sinter(parser: &mut ParsedCommand, db: &Database, dbindex: usize) -> Response {
     let key = try_validate!(parser.get_vec(1), "Invalid key");
-    let el = match db.get(dbindex, &key) {
+    let mut keys = Vec::with_capacity(parser.argv.len() - 1);
+    keys.push(key);
+    for i in 2..parser.argv.len() {
+        keys.push(try_validate!(parser.get_vec(i), "Invalid key"));
+    }
+    let refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+    let vals = fetch_all(db, dbindex, &refs);
+    let first = match vals[0].as_ref() {
         Some(e) => e,
         None => return Response::Array(vec![]),
     };
     let nil = Value::Nil;
-    let sets = get_values!(2, parser.argv.len(), parser, db, dbindex, &nil);
-    match el.sinter(&sets) {
+    let sets: Vec<&Value> = vals[1..]
+        .iter()
+        .map(|v| v.as_ref().unwrap_or(&nil))
+        .collect();
+    match first.sinter(&sets) {
         Ok(set) => Response::Array(
             set.iter()
                 .map(|x| Response::Data(x.clone()))
@@ -1514,36 +1879,47 @@ fn sinterstore(parser: &mut ParsedCommand, db: &mut Database, dbindex: usize) ->
     let destination_key = try_validate!(parser.get_vec(1), "Invalid destination");
     let set = {
         let key = try_validate!(parser.get_vec(2), "Invalid key");
+        let mut keys = Vec::with_capacity(parser.argv.len() - 2);
+        keys.push(key);
+        for i in 3..parser.argv.len() {
+            keys.push(try_validate!(parser.get_vec(i), "Invalid key"));
+        }
+        let refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+        let vals = fetch_all(db, dbindex, &refs);
         let nil = Value::Nil;
-        let el = match db.get(dbindex, &key) {
-            Some(e) => e,
-            None => &nil,
-        };
-        let sets = get_values!(3, parser.argv.len(), parser, db, dbindex, &nil);
-        match el.sinter(&sets) {
+        let sets: Vec<&Value> = vals
+            .iter()
+            .map(|v| v.as_ref().unwrap_or(&nil))
+            .collect();
+        match sets[0].sinter(&sets[1..]) {
             Ok(set) => set,
             Err(err) => return Response::Error(err.to_string()),
         }
     };
 
-    db.remove(dbindex, &destination_key);
     let r = set.len() as i64;
-    db.get_or_create(dbindex, &destination_key).create_set(set);
-    db.key_updated(dbindex, &destination_key);
+    let mut value = Value::Nil;
+    value.create_set(set);
+    cross_store(db, dbindex, &destination_key, value, None);
     Response::Integer(r)
 }
 
 fn sunion(parser: &mut ParsedCommand, db: &Database, dbindex: usize) -> Response {
     let key = try_validate!(parser.get_vec(1), "Invalid key");
-    let defaultel = Value::Nil;
-    let el = match db.get(dbindex, &key) {
-        Some(e) => e,
-        None => &defaultel,
-    };
+    let mut keys = Vec::with_capacity(parser.argv.len() - 1);
+    keys.push(key);
+    for i in 2..parser.argv.len() {
+        keys.push(try_validate!(parser.get_vec(i), "Invalid key"));
+    }
+    let refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+    let vals = fetch_all(db, dbindex, &refs);
     let nil = Value::Nil;
-    let sets = get_values!(2, parser.argv.len(), parser, db, dbindex, &nil);
+    let sets: Vec<&Value> = vals
+        .iter()
+        .map(|v| v.as_ref().unwrap_or(&nil))
+        .collect();
 
-    match el.sunion(&sets) {
+    match sets[0].sunion(&sets[1..]) {
         Ok(set) => Response::Array(
             set.iter()
                 .map(|x| Response::Data(x.clone()))
@@ -1558,23 +1934,28 @@ fn sunionstore(parser: &mut ParsedCommand, db: &mut Database, dbindex: usize) ->
     let destination_key = try_validate!(parser.get_vec(1), "Invalid destination");
     let set = {
         let key = try_validate!(parser.get_vec(2), "Invalid key");
-        let defaultel = Value::Nil;
-        let el = match db.get(dbindex, &key) {
-            Some(e) => e,
-            None => &defaultel,
-        };
+        let mut keys = Vec::with_capacity(parser.argv.len() - 2);
+        keys.push(key);
+        for i in 3..parser.argv.len() {
+            keys.push(try_validate!(parser.get_vec(i), "Invalid key"));
+        }
+        let refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+        let vals = fetch_all(db, dbindex, &refs);
         let nil = Value::Nil;
-        let sets = get_values!(3, parser.argv.len(), parser, db, dbindex, &nil);
-        match el.sunion(&sets) {
+        let sets: Vec<&Value> = vals
+            .iter()
+            .map(|v| v.as_ref().unwrap_or(&nil))
+            .collect();
+        match sets[0].sunion(&sets[1..]) {
             Ok(set) => set,
             Err(err) => return Response::Error(err.to_string()),
         }
     };
 
-    db.remove(dbindex, &destination_key);
     let r = set.len() as i64;
-    db.get_or_create(dbindex, &destination_key).create_set(set);
-    db.key_updated(dbindex, &destination_key);
+    let mut value = Value::Nil;
+    value.create_set(set);
+    cross_store(db, dbindex, &destination_key, value, None);
     Response::Integer(r)
 }
 
@@ -1829,15 +2210,24 @@ fn generic_zrange(
     rev: bool,
 ) -> Response {
     validate_arguments_gte!(parser, 4);
-    validate_arguments_lte!(parser, 5);
     let key = try_validate!(parser.get_vec(1), "Invalid key");
     let start = try_validate!(parser.get_i64(2), "Invalid start");
     let stop = try_validate!(parser.get_i64(3), "Invalid stop");
-    let withscores = parser.argv.len() == 5;
-    if withscores {
-        let p4 = try_validate!(parser.get_str(4), "Syntax error");
-        validate!(p4.to_ascii_lowercase() == "withscores", "Syntax error");
+
+    // ZRANGE accepts WITHSCORES and REV in any order.
+    let mut withscores = false;
+    let mut rev = rev;
+    let mut i = 4;
+    while i < parser.argv.len() {
+        let arg = &*try_validate!(parser.get_str(i), "syntax error").to_ascii_lowercase();
+        match arg {
+            "withscores" => withscores = true,
+            "rev" => rev = true,
+            _ => return Response::Error("ERR syntax error".to_owned()),
+        }
+        i += 1;
     }
+
     let el = match db.get(dbindex, &key) {
         Some(e) => e,
         None => return Response::Array(Vec::new()),
@@ -2043,6 +2433,63 @@ fn zlexcount(parser: &mut ParsedCommand, db: &mut Database, dbindex: usize) -> R
     }
 }
 
+fn generic_zpop(
+    parser: &mut ParsedCommand,
+    db: &mut Database,
+    dbindex: usize,
+    max: bool,
+) -> Response {
+    let len = parser.argv.len();
+    validate!(len >= 2, "Wrong number of parameters");
+    validate!(len <= 3, "Wrong number of parameters");
+    let key = try_validate!(parser.get_vec(1), "Invalid key");
+    let mut count: i64 = 1;
+    if len == 3 {
+        count = try_validate!(parser.get_i64(2), "Invalid count");
+        if count < 0 {
+            return Response::Error("ERR value is out of range, must be positive".to_owned());
+        }
+    }
+    if count == 0 {
+        return Response::Array(Vec::new());
+    }
+
+    let popped = {
+        let el = match db.get_mut(dbindex, &key) {
+            Some(e) => e,
+            None => return Response::Array(Vec::new()),
+        };
+        // Lowest/highest scored members first, interleaved with their scores.
+        let members = match el.zrange(0, count - 1, true, max) {
+            Ok(r) => r,
+            Err(err) => return Response::Error(err.to_string()),
+        };
+        for member in members.chunks(2) {
+            if let Err(err) = el.zrem(member[0].clone()) {
+                return Response::Error(err.to_string());
+            }
+        }
+        members
+    };
+    if !popped.is_empty() {
+        db.key_updated(dbindex, &key);
+    }
+    Response::Array(
+        popped
+            .iter()
+            .map(|x| Response::Data(x.clone()))
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn zpopmin(parser: &mut ParsedCommand, db: &mut Database, dbindex: usize) -> Response {
+    generic_zpop(parser, db, dbindex, false)
+}
+
+fn zpopmax(parser: &mut ParsedCommand, db: &mut Database, dbindex: usize) -> Response {
+    generic_zpop(parser, db, dbindex, true)
+}
+
 fn generic_zrank(
     db: &mut Database,
     dbindex: usize,
@@ -2101,8 +2548,17 @@ fn zinter_union_store(
             }
             n as usize
         };
+        let mut zkeys = Vec::with_capacity(numkeys);
+        for i in 0..numkeys {
+            zkeys.push(try_validate!(parser.get_vec(3 + i), "Invalid key"));
+        }
+        let zrefs: Vec<&[u8]> = zkeys.iter().map(|k| k.as_slice()).collect();
+        let owned = fetch_all(db, dbindex, &zrefs);
         let nil = Value::Nil;
-        let zsets = get_values!(3, 3 + numkeys, parser, db, dbindex, &nil);
+        let zsets: Vec<&Value> = owned
+            .iter()
+            .map(|v| v.as_ref().unwrap_or(&nil))
+            .collect();
         let mut pos = 3 + numkeys;
         let mut weights = None;
         let mut aggregate = zset::Aggregate::Sum;
@@ -2156,8 +2612,7 @@ fn zinter_union_store(
         Ok(count) => Response::Integer(count as i64),
         Err(err) => Response::Error(err.to_string()),
     };
-    *db.get_or_create(dbindex, &key) = value;
-    db.key_updated(dbindex, &key);
+    cross_store(db, dbindex, &key, value, None);
     r
 }
 
@@ -2759,9 +3214,18 @@ fn keys(parser: &mut ParsedCommand, db: &mut Database, dbindex: usize) -> Respon
     validate_arguments_exact!(parser, 2);
     let pattern = try_validate!(parser.get_vec(1), "Invalid pattern");
 
+    // Collect matches from every shard (our own lock is already held), so the
+    // result covers the whole logical database instead of one shard's slice.
     // FIXME: This might be a bit suboptimal, as db.keys already allocates a vector.
     // Instead we should collect only once.
-    let responses = db.keys(dbindex, &pattern);
+    let mut responses = match &db.sharded {
+        Some((weak, my_shard_idx)) => match weak.upgrade() {
+            Some(sharded) => sharded.keys_except(dbindex, &pattern, Some(*my_shard_idx)),
+            None => Vec::new(),
+        },
+        None => Vec::new(),
+    };
+    responses.extend(db.keys(dbindex, &pattern));
     Response::Array(responses.into_iter().map(Response::Data).collect())
 }
 
@@ -3086,7 +3550,9 @@ fn command_properties(command_name: &str) -> CommandProperties {
         "command" => (0, READONLY | LOADING | STALE, 0, 0, 0),
         "geoadd" => (-5, wm, 1, 1, 1),
         "georadius" => (-6, READONLY, 1, 1, 1),
+        "georadius_ro" => (-6, READONLY, 1, 1, 1),
         "georadiusbymember" => (-5, READONLY, 1, 1, 1),
+        "georadiusbymember_ro" => (-5, READONLY, 1, 1, 1),
         "geohash" => (-2, READONLY, 1, 1, 1),
         "geopos" => (-2, READONLY, 1, 1, 1),
         "geodist" => (-4, READONLY, 1, 1, 1),
@@ -3105,6 +3571,8 @@ fn command_properties(command_name: &str) -> CommandProperties {
         "smismember" => (-3, fr, 1, 1, 1),
         "sintercard" => (-3, READONLY, 0, 0, 0),
         "zmscore" => (-3, fr, 1, 1, 1),
+        "zpopmin" => (-2, wf, 1, 1, 1),
+        "zpopmax" => (-2, wf, 1, 1, 1),
         "zrandmember" => (-2, READONLY | RANDOM, 1, 1, 1),
         "copy" => (-3, wm, 1, 2, 1),
         "unlink" => (-2, WRITE, 1, -1, 1),
@@ -3194,16 +3662,34 @@ fn command_has_flags_test() {
 // --- Hash commands ---
 
 fn hset(parser: &mut ParsedCommand, db: &mut Database, dbindex: usize) -> Response {
-    validate_arguments_exact!(parser, 4);
+    // HSET key field value [field value ...]
+    validate!(parser.argv.len() >= 4, "Wrong number of parameters");
+    if (parser.argv.len() - 2) % 2 != 0 {
+        return Response::Error("ERR wrong number of arguments for 'hset' command".to_owned());
+    }
     let key = try_validate!(parser.get_vec(1), "Invalid key");
-    let field = try_validate!(parser.get_vec(2), "Invalid field");
-    let value = try_validate!(parser.get_vec(3), "Invalid value");
-    let r = match db.get_or_create(dbindex, &key).hset(field, value) {
-        Ok(is_new) => Response::Integer(if is_new { 1 } else { 0 }),
-        Err(err) => Response::Error(err.to_string()),
-    };
+    let mut field_values = Vec::with_capacity((parser.argv.len() - 2) / 2);
+    for i in (2..parser.argv.len()).step_by(2) {
+        let field = try_validate!(parser.get_vec(i), "Invalid field");
+        let value = try_validate!(parser.get_vec(i + 1), "Invalid value");
+        field_values.push((field, value));
+    }
+    let mut added = 0i64;
+    {
+        let el = db.get_or_create(dbindex, &key);
+        for (field, value) in &field_values {
+            match el.hset(field.clone(), value.clone()) {
+                Ok(is_new) => {
+                    if is_new {
+                        added += 1;
+                    }
+                }
+                Err(err) => return Response::Error(err.to_string()),
+            }
+        }
+    }
     db.key_updated(dbindex, &key);
-    r
+    Response::Integer(added)
 }
 
 fn hsetnx(parser: &mut ParsedCommand, db: &mut Database, dbindex: usize) -> Response {
@@ -3429,8 +3915,11 @@ fn mset(parser: &mut ParsedCommand, db: &mut Database, dbindex: usize) -> Respon
     for i in (1..parser.argv.len()).step_by(2) {
         let key = try_validate!(parser.get_vec(i), "Invalid key");
         let value = try_validate!(parser.get_vec(i + 1), "Invalid value");
-        let _ = generic_set(db, dbindex, key.clone(), value, false, false, None);
-        db.key_updated(dbindex, &key);
+        // Each pair is written on whichever shard hosts its key (MSET is not
+        // atomic across shards, like Redis Cluster's cross-slot MSET).
+        let mut val = Value::Nil;
+        let _ = val.set(value);
+        cross_store(db, dbindex, &key, val, None);
     }
     Response::Status("OK".to_owned())
 }
@@ -3440,73 +3929,79 @@ fn msetnx(parser: &mut ParsedCommand, db: &mut Database, dbindex: usize) -> Resp
     if (parser.argv.len() - 1) % 2 != 0 {
         return Response::Error("ERR wrong number of arguments for 'msetnx' command".to_owned());
     }
-    // Check if any of the keys already exist
+    // Check if any of the keys already exist (across shards)
+    let mut keys = Vec::with_capacity((parser.argv.len() - 1) / 2);
     for i in (1..parser.argv.len()).step_by(2) {
-        let key = try_validate!(parser.get_vec(i), "Invalid key");
-        if db.get(dbindex, &key).is_some() {
-            return Response::Integer(0);
-        }
+        keys.push(try_validate!(parser.get_vec(i), "Invalid key"));
+    }
+    let refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+    let vals = fetch_all(db, dbindex, &refs);
+    if vals.iter().any(|v| v.is_some()) {
+        return Response::Integer(0);
     }
     // None exist, set them all
-    for i in (1..parser.argv.len()).step_by(2) {
-        let key = try_validate!(parser.get_vec(i), "Invalid key");
-        let value = try_validate!(parser.get_vec(i + 1), "Invalid value");
-        let _ = generic_set(db, dbindex, key.clone(), value, false, false, None);
-        db.key_updated(dbindex, &key);
+    for (j, key) in keys.iter().enumerate() {
+        let value = try_validate!(parser.get_vec(2 + j * 2), "Invalid value");
+        let mut val = Value::Nil;
+        let _ = val.set(value);
+        cross_store(db, dbindex, key, val, None);
     }
     Response::Integer(1)
 }
 
 fn rename(parser: &mut ParsedCommand, db: &mut Database, dbindex: usize) -> Response {
-    validate_arguments_exact!(parser, 3);
-    let source = try_validate!(parser.get_vec(1), "Invalid key");
-    let dest = try_validate!(parser.get_vec(2), "Invalid key");
-    match db.remove(dbindex, &source) {
-        Some(value) => {
-            // Remove expiration from source, copy to dest
-            let expiration = db.get_msexpiration(dbindex, &source).cloned();
-            db.remove_msexpiration(dbindex, &source);
-            *db.get_or_create(dbindex, &dest) = value;
-            if let Some(exp) = expiration {
-                db.set_msexpiration(dbindex, dest.clone(), exp);
-            }
-            db.key_updated(dbindex, &source);
-            db.key_updated(dbindex, &dest);
-            Response::Status("OK".to_owned())
-        }
-        None => Response::Error("ERR no such key".to_owned()),
-    }
+    rename_generic(parser, db, dbindex, false)
 }
 
 fn renamenx(parser: &mut ParsedCommand, db: &mut Database, dbindex: usize) -> Response {
+    rename_generic(parser, db, dbindex, true)
+}
+
+/// Shared body of RENAME/RENAMENX: reads the source (value + TTL) from
+/// whichever shard hosts it and moves it onto the destination's shard.
+fn rename_generic(
+    parser: &mut ParsedCommand,
+    db: &mut Database,
+    dbindex: usize,
+    nx: bool,
+) -> Response {
     validate_arguments_exact!(parser, 3);
     let source = try_validate!(parser.get_vec(1), "Invalid key");
     let dest = try_validate!(parser.get_vec(2), "Invalid key");
-    if db.get(dbindex, &dest).is_some() {
+    if nx && key_exists(db, dbindex, &dest) {
         return Response::Integer(0);
     }
-    match db.remove(dbindex, &source) {
-        Some(value) => {
-            let expiration = db.get_msexpiration(dbindex, &source).cloned();
-            db.remove_msexpiration(dbindex, &source);
-            *db.get_or_create(dbindex, &dest) = value;
-            if let Some(exp) = expiration {
-                db.set_msexpiration(dbindex, dest.clone(), exp);
-            }
-            db.key_updated(dbindex, &source);
-            db.key_updated(dbindex, &dest);
-            Response::Integer(1)
-        }
-        None => Response::Error("ERR no such key".to_owned()),
+    let (value, expiration) = match cross_fetch(db, dbindex, &source) {
+        Some(vt) => vt,
+        None => return Response::Error("ERR no such key".to_owned()),
+    };
+    cross_remove(db, dbindex, &source);
+    cross_store(db, dbindex, &dest, value, expiration);
+    db.key_updated(dbindex, &source);
+    db.key_updated(dbindex, &dest);
+    if nx {
+        Response::Integer(1)
+    } else {
+        Response::Status("OK".to_owned())
     }
 }
 
 fn randomkey(parser: &mut ParsedCommand, db: &Database, dbindex: usize) -> Response {
     validate_arguments_exact!(parser, 1);
-    match db.randomkey(dbindex) {
-        Some(key) => Response::Data(key),
-        None => Response::Nil,
+    // Pick from the whole logical database across shards, not just our own.
+    let mut keys = match &db.sharded {
+        Some((weak, my_shard_idx)) => match weak.upgrade() {
+            Some(sharded) => sharded.data_keys_except(dbindex, Some(*my_shard_idx)),
+            None => Vec::new(),
+        },
+        None => Vec::new(),
+    };
+    keys.extend(db.data_keys(dbindex).into_iter().cloned());
+    if keys.is_empty() {
+        return Response::Nil;
     }
+    let pos = rand::random::<usize>() % keys.len();
+    Response::Data(keys.remove(pos))
 }
 
 fn time_command(parser: &mut ParsedCommand) -> Response {
@@ -3630,12 +4125,17 @@ fn bitop(parser: &mut ParsedCommand, db: &mut Database, dbindex: usize) -> Respo
         return Response::Error("ERR BITOP NOT requires one and only one key".to_owned());
     }
 
-    // Collect all source data
-    let mut keys = Vec::with_capacity(parser.argv.len() - 3);
-    let mut max_len = 0usize;
+    // Collect all source data (wherever the keys are hosted)
+    let mut src_keys = Vec::with_capacity(parser.argv.len() - 3);
     for i in 3..parser.argv.len() {
-        let key = try_validate!(parser.get_vec(i), "Invalid key");
-        let data = match db.get(dbindex, &key) {
+        src_keys.push(try_validate!(parser.get_vec(i), "Invalid key"));
+    }
+    let src_refs: Vec<&[u8]> = src_keys.iter().map(|k| k.as_slice()).collect();
+    let owned = fetch_all(db, dbindex, &src_refs);
+    let mut keys = Vec::with_capacity(owned.len());
+    let mut max_len = 0usize;
+    for value in owned {
+        let data = match value {
             Some(value) => match value.get() {
                 Ok(d) => d,
                 Err(err) => return Response::Error(err.to_string()),
@@ -3684,13 +4184,12 @@ fn bitop(parser: &mut ParsedCommand, db: &mut Database, dbindex: usize) -> Respo
         _ => unreachable!(),
     }
 
-    match db.get_or_create(dbindex, &destkey).set(result.clone()) {
-        Ok(_) => {
-            db.key_updated(dbindex, &destkey);
-            Response::Integer(max_len as i64)
-        }
-        Err(err) => Response::Error(err.to_string()),
+    let mut value = Value::Nil;
+    if let Err(err) = value.set(result) {
+        return Response::Error(err.to_string());
     }
+    cross_store(db, dbindex, &destkey, value, None);
+    Response::Integer(max_len as i64)
 }
 
 // --- Scan helpers ---
@@ -3791,7 +4290,20 @@ fn scan_command(parser: &mut ParsedCommand, db: &Database, dbindex: usize) -> Re
     let cursor = cursor.max(0) as usize;
     let (pattern, count) = scan_parse_args(parser, 2);
 
-    let keys: Vec<&Vec<u8>> = db.data_keys(dbindex);
+    // Merge the keys of this logical database from every shard (our own lock
+    // is already held). Sorting keeps the cursor pagination stable across
+    // calls, even though each shard's map iterates in hash order.
+    let mut keys: Vec<Vec<u8>> = match &db.sharded {
+        Some((weak, my_shard_idx)) => match weak.upgrade() {
+            Some(sharded) => sharded.data_keys_except(dbindex, Some(*my_shard_idx)),
+            None => Vec::new(),
+        },
+        None => Vec::new(),
+    };
+    keys.extend(db.data_keys(dbindex).into_iter().cloned());
+    keys.sort();
+    keys.dedup();
+
     let total = keys.len();
 
     let mut results = vec![];
@@ -3806,7 +4318,7 @@ fn scan_command(parser: &mut ParsedCommand, db: &Database, dbindex: usize) -> Re
     let mut idx = cursor;
     let mut scanned = 0;
     while scanned < count && idx < total {
-        let key = keys[idx];
+        let key = &keys[idx];
         idx += 1;
         scanned += 1;
         let matches = match &pattern {
@@ -5364,7 +5876,7 @@ fn evalsha_command(parser: &mut ParsedCommand, db: &mut Database, dbindex: usize
     crate::scripting::evalsha_script(db, dbindex, &sha, &keys, &argv)
 }
 
-fn script_command(parser: &mut ParsedCommand, db: &Database) -> Response {
+fn script_command(parser: &mut ParsedCommand, db: &mut Database) -> Response {
     validate_arguments_gte!(parser, 2);
     let subcmd = try_validate!(parser.get_str(1), "ERR syntax error");
     match subcmd.to_ascii_lowercase().as_str() {
@@ -5377,13 +5889,19 @@ fn script_command(parser: &mut ParsedCommand, db: &Database) -> Response {
             }
             Response::Array(results)
         }
-        "flush" => Response::Status("OK".to_owned()),
+        "flush" => {
+            db.script_cache.clear();
+            Response::Status("OK".to_owned())
+        }
         "load" => {
             if parser.argv.len() < 3 {
                 return Response::Error("ERR wrong number of arguments for 'script load' command".to_owned());
             }
             let source = try_validate!(parser.get_vec(2), "ERR syntax error");
             let sha = crate::scripting::script_sha1(&source);
+            // SCRIPT LOAD must register the script so EVALSHA can find it.
+            db.script_cache
+                .insert(sha.clone(), String::from_utf8_lossy(&source).to_string());
             Response::Data(sha.into_bytes())
         }
         _ => Response::Error(format!("ERR unknown subcommand '{}'", subcmd)),
@@ -5605,7 +6123,7 @@ fn lmove(parser: &mut ParsedCommand, db: &mut Database, dbindex: usize) -> Respo
         "right" => true,
         _ => return Response::Error("ERR syntax error".to_owned()),
     };
-    generic_lmove(db, dbindex, &source, &destination, src_right, dst_right)
+    generic_pop_push_cross(db, dbindex, &source, &destination, src_right, dst_right)
 }
 
 // --- BLMOVE source destination LEFT|RIGHT LEFT|RIGHT timeout ---
@@ -5777,10 +6295,14 @@ fn sintercard(parser: &mut ParsedCommand, db: &Database, dbindex: usize) -> Resp
             _ => return Response::Error("ERR syntax error".to_owned()),
         }
     }
-    // Compute intersection cardinality
-    let sets: Vec<&Value> = keys.iter().map(|k| {
-        db.get(dbindex, k).unwrap_or(&Value::Nil)
-    }).collect();
+    // Compute intersection cardinality (members gathered from every shard)
+    let refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+    let vals = fetch_all(db, dbindex, &refs);
+    let nil = Value::Nil;
+    let sets: Vec<&Value> = vals
+        .iter()
+        .map(|v| v.as_ref().unwrap_or(&nil))
+        .collect();
     // Get the smallest set for efficiency
     let mut min_size = usize::MAX;
     let mut min_idx = 0;
@@ -5898,21 +6420,14 @@ fn copy(parser: &mut ParsedCommand, db: &mut Database, dbindex: usize) -> Respon
             _ => return Response::Error("ERR syntax error".to_owned()),
         }
     }
-    // Check if destination exists
-    if !replace && db.get(dest_db, &destination).is_some() {
+    // Check if destination exists (across shards)
+    if !replace && key_exists(db, dest_db, &destination) {
         return Response::Integer(0);
     }
-    // Copy the value
-    match db.get(dbindex, &source) {
-        Some(val) => {
-            let val_clone = val.clone();
-            db.remove(dest_db, &destination);
-            *db.get_or_create(dest_db, &destination) = val_clone;
-            db.key_updated(dest_db, &destination);
-            // Copy expiration if any
-            if let Some(&exp) = db.get_msexpiration(dbindex, &source) {
-                db.set_msexpiration(dest_db, destination, exp);
-            }
+    // Copy the value (and TTL) from the source's shard to the destination's
+    match cross_fetch(db, dbindex, &source) {
+        Some((val_clone, expiration)) => {
+            cross_store(db, dest_db, &destination, val_clone, expiration);
             Response::Integer(1)
         }
         None => Response::Integer(0),
@@ -5925,7 +6440,7 @@ fn unlink(parser: &mut ParsedCommand, db: &mut Database, dbindex: usize) -> Resp
     let mut count = 0i64;
     for i in 1..parser.argv.len() {
         let key = try_validate!(parser.get_vec(i), "Invalid key");
-        if db.remove(dbindex, &key).is_some() {
+        if cross_remove(db, dbindex, &key) {
             count += 1;
         }
     }
@@ -5938,7 +6453,7 @@ fn touch(parser: &mut ParsedCommand, db: &mut Database, dbindex: usize) -> Respo
     let mut count = 0i64;
     for i in 1..parser.argv.len() {
         let key = try_validate!(parser.get_vec(i), "Invalid key");
-        if db.get(dbindex, &key).is_some() {
+        if key_exists(db, dbindex, &key) {
             db.key_updated(dbindex, &key);
             count += 1;
         }
@@ -6198,7 +6713,10 @@ fn zdiff(parser: &mut ParsedCommand, db: &Database, dbindex: usize) -> Response 
         else { return Response::Error("ERR syntax error".to_owned()); }
     }
     let first_key = try_validate!(parser.get_vec(2), "Invalid key");
-    let first_val = db.get(dbindex, &first_key);
+    let first_val = fetch_all(db, dbindex, &[first_key.as_slice()])
+        .into_iter()
+        .next()
+        .flatten();
     // Get all members with scores from first set
     let first_members = match first_val {
         Some(val) => match val.zrange(0, -1, true, false) {
@@ -6207,6 +6725,13 @@ fn zdiff(parser: &mut ParsedCommand, db: &Database, dbindex: usize) -> Response 
         },
         None => return Response::Array(vec![]),
     };
+    // Gather the other sets (wherever hosted)
+    let mut other_keys = Vec::with_capacity(numkeys - 1);
+    for k in 1..numkeys {
+        other_keys.push(try_validate!(parser.get_vec(2 + k), "Invalid key"));
+    }
+    let orefs: Vec<&[u8]> = other_keys.iter().map(|k| k.as_slice()).collect();
+    let others = fetch_all(db, dbindex, &orefs);
     let mut result = Vec::new();
     for chunk in first_members.chunks(2) {
         if chunk.len() < 2 { break; }
@@ -6214,13 +6739,10 @@ fn zdiff(parser: &mut ParsedCommand, db: &Database, dbindex: usize) -> Response 
         let score_str = &chunk[1];
         // Check if member exists in any other set
         let mut found = false;
-        for k in 1..numkeys {
-            let other_key = try_validate!(parser.get_vec(2 + k), "Invalid key");
-            if let Some(other_val) = db.get(dbindex, &other_key) {
-                if let Ok(Some(_)) = other_val.zscore(member.clone()) {
-                    found = true;
-                    break;
-                }
+        for other_val in others.iter().flatten() {
+            if let Ok(Some(_)) = other_val.zscore(member.clone()) {
+                found = true;
+                break;
             }
         }
         if !found {
@@ -6242,46 +6764,52 @@ fn zdiffstore(parser: &mut ParsedCommand, db: &mut Database, dbindex: usize) -> 
     validate_arguments_gte!(parser, 3 + numkeys);
     // Compute diff result first
     let first_key = try_validate!(parser.get_vec(3), "Invalid key");
-    let first_val = db.get(dbindex, &first_key);
+    let first_val = fetch_all(db, dbindex, &[first_key.as_slice()])
+        .into_iter()
+        .next()
+        .flatten();
     let first_members = match first_val {
         Some(val) => match val.zrange(0, -1, true, false) {
             Ok(m) => m,
             Err(e) => return Response::Error(e.to_string()),
         },
         None => {
-            db.remove(dbindex, &destination);
+            cross_remove(db, dbindex, &destination);
             return Response::Integer(0);
         }
     };
+    // Gather the other sets (wherever hosted)
+    let mut other_keys = Vec::with_capacity(numkeys - 1);
+    for k in 1..numkeys {
+        other_keys.push(try_validate!(parser.get_vec(3 + k), "Invalid key"));
+    }
+    let orefs: Vec<&[u8]> = other_keys.iter().map(|k| k.as_slice()).collect();
+    let others = fetch_all(db, dbindex, &orefs);
     let mut result_members: Vec<(Vec<u8>, f64)> = Vec::new();
     for chunk in first_members.chunks(2) {
         if chunk.len() < 2 { break; }
         let member = &chunk[0];
         let score: f64 = String::from_utf8_lossy(&chunk[1]).parse().unwrap_or(0.0);
         let mut found = false;
-        for k in 1..numkeys {
-            let other_key = try_validate!(parser.get_vec(3 + k), "Invalid key");
-            if let Some(other_val) = db.get(dbindex, &other_key) {
-                if let Ok(Some(_)) = other_val.zscore(member.clone()) {
-                    found = true;
-                    break;
-                }
+        for other_val in others.iter().flatten() {
+            if let Ok(Some(_)) = other_val.zscore(member.clone()) {
+                found = true;
+                break;
             }
         }
         if !found {
             result_members.push((member.clone(), score));
         }
     }
-    // Store result
-    db.remove(dbindex, &destination);
-    let dest_val = db.get_or_create(dbindex, &destination);
+    // Store result (with the members/scores already computed)
+    let mut result_val = Value::Nil;
     for (member, score) in &result_members {
-        if let Err(e) = dest_val.zadd(*score, member.clone(), false, false, false, false) {
+        if let Err(e) = result_val.zadd(*score, member.clone(), false, false, false, false) {
             return Response::Error(e.to_string());
         }
     }
+    cross_store(db, dbindex, &destination, result_val, None);
     let card = result_members.len();
-    db.key_updated(dbindex, &destination);
     Response::Integer(card as i64)
 }
 
@@ -6324,10 +6852,12 @@ fn zinter_command(parser: &mut ParsedCommand, db: &Database, dbindex: usize) -> 
             _ => return Response::Error("ERR syntax error".to_owned()),
         }
     }
-    // Build zset values for intersection
-    let vals: Vec<Value> = keys.iter().map(|k| {
-        db.get(dbindex, k).cloned().unwrap_or(Value::Nil)
-    }).collect();
+    // Build zset values for intersection (members gathered from every shard)
+    let refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+    let vals: Vec<Value> = fetch_all(db, dbindex, &refs)
+        .into_iter()
+        .map(|v| v.unwrap_or(Value::Nil))
+        .collect();
     let val_refs: Vec<&Value> = vals.iter().collect();
     match Value::Nil.zinter(&val_refs, weights, aggregate) {
         Ok(result) => {
@@ -6378,9 +6908,11 @@ fn zunion_command(parser: &mut ParsedCommand, db: &Database, dbindex: usize) -> 
             _ => return Response::Error("ERR syntax error".to_owned()),
         }
     }
-    let vals: Vec<Value> = keys.iter().map(|k| {
-        db.get(dbindex, k).cloned().unwrap_or(Value::Nil)
-    }).collect();
+    let refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+    let vals: Vec<Value> = fetch_all(db, dbindex, &refs)
+        .into_iter()
+        .map(|v| v.unwrap_or(Value::Nil))
+        .collect();
     let val_refs: Vec<&Value> = vals.iter().collect();
     match Value::Nil.zunion(&val_refs, weights, aggregate) {
         Ok(result) => {
@@ -6416,10 +6948,12 @@ fn zintercard(parser: &mut ParsedCommand, db: &Database, dbindex: usize) -> Resp
             _ => return Response::Error("ERR syntax error".to_owned()),
         }
     }
-    // Compute intersection cardinality using zinter
-    let vals: Vec<Value> = keys.iter().map(|k| {
-        db.get(dbindex, k).cloned().unwrap_or(Value::Nil)
-    }).collect();
+    // Compute intersection cardinality using zinter (members from every shard)
+    let refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+    let vals: Vec<Value> = fetch_all(db, dbindex, &refs)
+        .into_iter()
+        .map(|v| v.unwrap_or(Value::Nil))
+        .collect();
     let val_refs: Vec<&Value> = vals.iter().collect();
     match Value::Nil.zinter(&val_refs, None, zset::Aggregate::Sum) {
         Ok(result) => {
@@ -6945,13 +7479,15 @@ fn xread(parser: &mut ParsedCommand, db: &Database, dbindex: usize) -> Response 
 // --- XGROUP CREATE|CREATECONSUMER|SETID|DESTROY|DELCONSUMER ---
 fn xgroup(parser: &mut ParsedCommand, db: &mut Database, dbindex: usize) -> Response {
     validate_arguments_gte!(parser, 3);
-    let subcmd = try_validate!(parser.get_str(2), "ERR syntax error").to_ascii_lowercase();
+    // XGROUP <subcommand> key ... — the subcommand sits at argument 1.
+    let subcmd = try_validate!(parser.get_str(1), "ERR syntax error").to_ascii_lowercase();
     match subcmd.as_str() {
         "create" => {
+            // XGROUP CREATE key group id [MKSTREAM]
             validate_arguments_gte!(parser, 5);
-            let key = try_validate!(parser.get_vec(3), "Invalid key");
-            let group_name = try_validate!(parser.get_vec(4), "Invalid group name");
-            let id_str = try_validate!(parser.get_str(5), "ERR syntax error");
+            let key = try_validate!(parser.get_vec(2), "Invalid key");
+            let group_name = try_validate!(parser.get_vec(3), "Invalid group name");
+            let id_str = try_validate!(parser.get_str(4), "ERR syntax error");
             let id = if id_str == "$" {
                 None // Will use stream's last_id
             } else {
@@ -6961,8 +7497,8 @@ fn xgroup(parser: &mut ParsedCommand, db: &mut Database, dbindex: usize) -> Resp
                 }
             };
             // Create stream if it doesn't exist (MKSTREAM option)
-            let mkstream = parser.argv.len() > 6 && {
-                if let Ok(s) = parser.get_str(6) { s.to_ascii_lowercase() == "mkstream" } else { false }
+            let mkstream = parser.argv.len() > 5 && {
+                if let Ok(s) = parser.get_str(5) { s.to_ascii_lowercase() == "mkstream" } else { false }
             };
             if db.get(dbindex, &key).is_none() {
                 if mkstream {
@@ -7183,11 +7719,13 @@ fn xpending(parser: &mut ParsedCommand, db: &Database, dbindex: usize) -> Respon
 // --- XINFO STREAM|GROUPS|CONSUMERS key [group] ---
 fn xinfo(parser: &mut ParsedCommand, db: &Database, dbindex: usize) -> Response {
     validate_arguments_gte!(parser, 3);
-    let subcmd = try_validate!(parser.get_str(2), "ERR syntax error").to_ascii_lowercase();
+    // XINFO <subcommand> key ... — the subcommand sits at argument 1.
+    let subcmd = try_validate!(parser.get_str(1), "ERR syntax error").to_ascii_lowercase();
     match subcmd.as_str() {
         "stream" => {
-            validate_arguments_gte!(parser, 4);
-            let key = try_validate!(parser.get_vec(3), "Invalid key");
+            // XINFO STREAM key
+            validate_arguments_gte!(parser, 3);
+            let key = try_validate!(parser.get_vec(2), "Invalid key");
             match db.get(dbindex, &key) {
                 Some(Value::Stream(s)) => {
                     let info = s.xinfo();
@@ -7208,8 +7746,9 @@ fn xinfo(parser: &mut ParsedCommand, db: &Database, dbindex: usize) -> Response 
             }
         }
         "groups" => {
-            validate_arguments_gte!(parser, 4);
-            let key = try_validate!(parser.get_vec(3), "Invalid key");
+            // XINFO GROUPS key
+            validate_arguments_gte!(parser, 3);
+            let key = try_validate!(parser.get_vec(2), "Invalid key");
             match db.get(dbindex, &key) {
                 Some(Value::Stream(s)) => {
                     let groups = s.xinfo_groups();
@@ -7229,9 +7768,10 @@ fn xinfo(parser: &mut ParsedCommand, db: &Database, dbindex: usize) -> Response 
             }
         }
         "consumers" => {
-            validate_arguments_gte!(parser, 5);
-            let key = try_validate!(parser.get_vec(3), "Invalid key");
-            let group_name = try_validate!(parser.get_vec(4), "Invalid group name");
+            // XINFO CONSUMERS key group
+            validate_arguments_gte!(parser, 4);
+            let key = try_validate!(parser.get_vec(2), "Invalid key");
+            let group_name = try_validate!(parser.get_vec(3), "Invalid group name");
             match db.get(dbindex, &key) {
                 Some(Value::Stream(s)) => {
                     match s.xinfo_consumers(&group_name) {
@@ -7590,7 +8130,42 @@ fn geosearch(parser: &mut ParsedCommand, db: &Database, dbindex: usize) -> Respo
     }
 
     // Get all members and filter by distance
-    match db.get(dbindex, &key) {
+    geosearch_query(
+        db,
+        dbindex,
+        &key,
+        center_lon,
+        center_lat,
+        radius_m,
+        box_width_m,
+        box_height_m,
+        asc,
+        desc,
+        count,
+        withcoord,
+        withdist,
+    )
+}
+
+/// Core GEOSEARCH query: filter the geoset members around the given center,
+/// sort, apply COUNT and format the reply. Shared with GEORADIUS*.
+#[allow(clippy::too_many_arguments)]
+fn geosearch_query(
+    db: &Database,
+    dbindex: usize,
+    key: &[u8],
+    center_lon: f64,
+    center_lat: f64,
+    radius_m: Option<f64>,
+    box_width_m: Option<f64>,
+    box_height_m: Option<f64>,
+    asc: bool,
+    desc: bool,
+    count: Option<usize>,
+    withcoord: bool,
+    withdist: bool,
+) -> Response {
+    match db.get(dbindex, key) {
         Some(Value::SortedSet(s)) => {
             let card = s.zcard();
             let all = s.zrange(0, (card as i64) - 1, true, false);
@@ -7660,41 +8235,310 @@ fn geosearch(parser: &mut ParsedCommand, db: &Database, dbindex: usize) -> Respo
     }
 }
 
-// --- GEOSEARCHSTORE destination source [FROMMEMBER|FROMLONLAT ...] [BYRADIUS|BYBOX ...] [ASC|DESC] [COUNT ...] [STOREDIST] ---
-fn geosearchstore(parser: &mut ParsedCommand, db: &mut Database, dbindex: usize) -> Response {
-    // For now, delegate to geosearch logic and store results
-    validate_arguments_gte!(parser, 3);
-    let destination = try_validate!(parser.get_vec(1), "Invalid key");
-    let source = try_validate!(parser.get_vec(2), "Invalid key");
-
-    // Check for STOREDIST option
-    let _storedist = parser.argv.iter().any(|a| {
-        parser.get_str(a.pos).map(|s| s.to_ascii_lowercase() == "storedist").unwrap_or(false)
-    });
-
-    // Simplified: just return the count of stored elements
-    // A full implementation would re-run geosearch on the source and store to destination
-    let result = geosearch(parser, db, dbindex);
-
-    // Count results
-    let count = match &result {
-        Response::Array(arr) => arr.len(),
-        _ => 0,
+// --- GEORADIUS key longitude latitude radius m|km|ft|mi [options] ---
+// Deprecated in Redis in favor of GEOSEARCH; implemented here as a thin
+// wrapper that resolves the center point and reuses geosearch_query.
+fn georadius_generic(
+    parser: &mut ParsedCommand,
+    db: &Database,
+    dbindex: usize,
+    frommember: bool,
+) -> Response {
+    let len = parser.argv.len();
+    let (name, min_args) = if frommember {
+        ("georadiusbymember", 5)
+    } else {
+        ("georadius", 6)
     };
+    if len < min_args {
+        return Response::Error(format!("ERR wrong number of arguments for '{}' command", name));
+    }
+    let key = try_validate!(parser.get_vec(1), "Invalid key");
 
-    if count > 0 {
-        // Store results as a sorted set at destination
-        // For simplicity, copy the source key to destination
-        match db.get(dbindex, &source) {
-            Some(val) => {
-                *db.get_or_create(dbindex, &destination) = val.clone();
-                db.key_updated(dbindex, &destination);
+    let mut center_lon = 0.0;
+    let mut center_lat = 0.0;
+    if frommember {
+        let member = try_validate!(parser.get_vec(2), "Invalid member");
+        let found = match db.get(dbindex, &key) {
+            Some(Value::SortedSet(s)) => match s.zscore(&member) {
+                Some(score) => {
+                    let (lon, lat) = geo::score_to_geohash(score);
+                    center_lon = lon;
+                    center_lat = lat;
+                    true
+                }
+                None => false,
+            },
+            _ => false,
+        };
+        if !found {
+            return Response::Error(
+                "ERR could not decode requested member from sorted set".to_owned(),
+            );
+        }
+    } else {
+        center_lon = match parser.get_f64(2) {
+            Ok(v) => v,
+            Err(_) => return Response::Error("ERR value is not a valid float".to_owned()),
+        };
+        center_lat = match parser.get_f64(3) {
+            Ok(v) => v,
+            Err(_) => return Response::Error("ERR value is not a valid float".to_owned()),
+        };
+    }
+
+    let radius_idx = if frommember { 3 } else { 4 };
+    let r = match parser.get_f64(radius_idx) {
+        Ok(v) => v,
+        Err(_) => return Response::Error("ERR value is not a valid float".to_owned()),
+    };
+    let unit = match parser.get_str(radius_idx + 1) {
+        Ok(s) => s.to_ascii_lowercase(),
+        Err(_) => return Response::Error("ERR syntax error".to_owned()),
+    };
+    let radius_m = r * geo::unit_to_meters(&unit);
+
+    // Optional flags: WITHCOORD/WITHDIST/WITHHASH/COUNT n [ANY]/ASC/DESC.
+    // STORE/STOREDIST are skipped (not supported).
+    let mut withcoord = false;
+    let mut withdist = false;
+    let mut asc = false;
+    let mut desc = false;
+    let mut count: Option<usize> = None;
+    let mut i = radius_idx + 2;
+    while i < len {
+        let opt = match parser.get_str(i) {
+            Ok(s) => s.to_ascii_lowercase(),
+            Err(_) => { i += 1; continue; }
+        };
+        match opt.as_str() {
+            "withcoord" => { withcoord = true; i += 1; }
+            "withdist" => { withdist = true; i += 1; }
+            "withhash" => { i += 1; }
+            "asc" => { asc = true; i += 1; }
+            "desc" => { desc = true; i += 1; }
+            "count" => {
+                i += 1;
+                if let Ok(c) = parser.get_i64(i) {
+                    count = Some(c.max(0) as usize);
+                }
+                i += 1;
+                if i < len {
+                    if let Ok(s) = parser.get_str(i) {
+                        if s.to_ascii_lowercase() == "any" { i += 1; }
+                    }
+                }
             }
-            None => {}
+            "store" | "storedist" => { i += 2; }
+            _ => { i += 1; }
         }
     }
 
-    Response::Integer(count as i64)
+    geosearch_query(
+        db,
+        dbindex,
+        &key,
+        center_lon,
+        center_lat,
+        Some(radius_m),
+        None,
+        None,
+        asc,
+        desc,
+        count,
+        withcoord,
+        withdist,
+    )
+}
+
+fn georadius(parser: &mut ParsedCommand, db: &Database, dbindex: usize) -> Response {
+    georadius_generic(parser, db, dbindex, false)
+}
+
+fn georadius_ro(parser: &mut ParsedCommand, db: &Database, dbindex: usize) -> Response {
+    georadius_generic(parser, db, dbindex, false)
+}
+
+fn georadiusbymember(parser: &mut ParsedCommand, db: &Database, dbindex: usize) -> Response {
+    georadius_generic(parser, db, dbindex, true)
+}
+
+fn georadiusbymember_ro(parser: &mut ParsedCommand, db: &Database, dbindex: usize) -> Response {
+    georadius_generic(parser, db, dbindex, true)
+}
+
+// --- GEOSEARCHSTORE destination source [FROMMEMBER|FROMLONLAT ...] [BYRADIUS|BYBOX ...] [ASC|DESC] [COUNT ...] [STOREDIST] ---
+// --- GEOSEARCHSTORE destination source (FROMMEMBER member | FROMLONLAT lon lat)
+//     (BYRADIUS radius unit | BYBOX width height unit) [ASC|DESC] [COUNT count [ANY]] [STOREDIST] ---
+fn geosearchstore(parser: &mut ParsedCommand, db: &mut Database, dbindex: usize) -> Response {
+    validate_arguments_gte!(parser, 5);
+    let destination = try_validate!(parser.get_vec(1), "Invalid key");
+    let source = try_validate!(parser.get_vec(2), "Invalid key");
+
+    // Center: FROMMEMBER member | FROMLONLAT lon lat (at argument 3)
+    let mut center_lon = 0.0;
+    let mut center_lat = 0.0;
+    let from_kw = try_validate!(parser.get_str(3), "ERR syntax error").to_ascii_lowercase();
+    match from_kw.as_str() {
+        "frommember" => {
+            let member = try_validate!(parser.get_vec(4), "Invalid member");
+            let found = match db.get(dbindex, &source) {
+                Some(Value::SortedSet(s)) => match s.zscore(&member) {
+                    Some(score) => {
+                        let (lon, lat) = geo::score_to_geohash(score);
+                        center_lon = lon;
+                        center_lat = lat;
+                        true
+                    }
+                    None => false,
+                },
+                _ => false,
+            };
+            if !found {
+                return Response::Error(
+                    "ERR could not decode requested member from sorted set".to_owned(),
+                );
+            }
+        }
+        "fromlonlat" => {
+            center_lon = match parser.get_f64(4) {
+                Ok(v) => v,
+                Err(_) => return Response::Error("ERR value is not a valid float".to_owned()),
+            };
+            center_lat = match parser.get_f64(5) {
+                Ok(v) => v,
+                Err(_) => return Response::Error("ERR value is not a valid float".to_owned()),
+            };
+        }
+        _ => return Response::Error("ERR syntax error".to_owned()),
+    }
+
+    // Shape: BYRADIUS radius unit | BYBOX width height unit
+    let next = if from_kw == "frommember" { 5 } else { 6 };
+    let shape_kw = match parser.get_str(next) {
+        Ok(s) => s.to_ascii_lowercase(),
+        Err(_) => return Response::Error("ERR syntax error".to_owned()),
+    };
+    let (radius_m, box_w, box_h) = match shape_kw.as_str() {
+        "byradius" => {
+            let r = match parser.get_f64(next + 1) {
+                Ok(v) => v,
+                Err(_) => return Response::Error("ERR value is not a valid float".to_owned()),
+            };
+            let unit = match parser.get_str(next + 2) {
+                Ok(s) => s.to_ascii_lowercase(),
+                Err(_) => return Response::Error("ERR syntax error".to_owned()),
+            };
+            (Some(r * geo::unit_to_meters(&unit)), None, None)
+        }
+        "bybox" => {
+            let w = match parser.get_f64(next + 1) {
+                Ok(v) => v,
+                Err(_) => return Response::Error("ERR value is not a valid float".to_owned()),
+            };
+            let h = match parser.get_f64(next + 2) {
+                Ok(v) => v,
+                Err(_) => return Response::Error("ERR value is not a valid float".to_owned()),
+            };
+            let unit = match parser.get_str(next + 3) {
+                Ok(s) => s.to_ascii_lowercase(),
+                Err(_) => return Response::Error("ERR syntax error".to_owned()),
+            };
+            let m = geo::unit_to_meters(&unit);
+            (None, Some(w * m), Some(h * m))
+        }
+        _ => return Response::Error("ERR syntax error".to_owned()),
+    };
+
+    // Optional flags: ASC|DESC, COUNT count [ANY], STOREDIST.
+    let opt_start = if shape_kw == "byradius" { next + 3 } else { next + 4 };
+    let mut storedist = false;
+    let mut asc = false;
+    let mut desc = false;
+    let mut count: Option<usize> = None;
+    let mut i = opt_start;
+    while i < parser.argv.len() {
+        let opt = match parser.get_str(i) {
+            Ok(s) => s.to_ascii_lowercase(),
+            Err(_) => { i += 1; continue; }
+        };
+        match opt.as_str() {
+            "storedist" => { storedist = true; i += 1; }
+            "asc" => { asc = true; i += 1; }
+            "desc" => { desc = true; i += 1; }
+            "count" => {
+                i += 1;
+                if let Ok(c) = parser.get_i64(i) {
+                    count = Some(c.max(0) as usize);
+                }
+                i += 1;
+                if i < parser.argv.len() {
+                    if let Ok(s) = parser.get_str(i) {
+                        if s.to_ascii_lowercase() == "any" { i += 1; }
+                    }
+                }
+            }
+            _ => { i += 1; }
+        }
+    }
+
+    // Run the search against the source key.
+    let result = geosearch_query(
+        db,
+        dbindex,
+        &source,
+        center_lon,
+        center_lat,
+        radius_m,
+        box_w,
+        box_h,
+        asc,
+        desc,
+        count,
+        false,     // withcoord
+        storedist, // withdist: the distance becomes the score when STOREDIST is set
+    );
+
+    // Extract (score, member) pairs from the search result.
+    let mut entries: Vec<(f64, Vec<u8>)> = Vec::new();
+    if let Response::Array(arr) = result {
+        if storedist {
+            for item in arr {
+                if let Response::Array(pair) = item {
+                    if pair.len() == 2 {
+                        if let (Response::Data(m), Response::Data(d)) = (&pair[0], &pair[1]) {
+                            if let Ok(dist) = std::str::from_utf8(d).unwrap_or("").parse::<f64>() {
+                                entries.push((dist, m.clone()));
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            for item in arr {
+                if let Response::Data(m) = item {
+                    // Keep the original geohash score from the source set.
+                    let score = match db.get(dbindex, &source) {
+                        Some(Value::SortedSet(s)) => s.zscore(&m).unwrap_or(0.0),
+                        _ => 0.0,
+                    };
+                    entries.push((score, m));
+                }
+            }
+        }
+    }
+
+    // Store the results into the destination (cross-shard aware;
+    // cross_store replaces any previous value and notifies key watchers).
+    if !entries.is_empty() {
+        let mut zset = zset::ValueSortedSet::new();
+        for (score, member) in entries.iter() {
+            let _ = zset.zadd(*score, member.clone(), false, false, false, false, false);
+        }
+        cross_store(db, dbindex, &destination, Value::SortedSet(zset), None);
+    }
+
+    Response::Integer(entries.len() as i64)
 }
 
 // --- Phase 1.4: Hash per-field expiration commands ---
@@ -8065,6 +8909,19 @@ fn acl_command(parser: &mut ParsedCommand, db: &mut Database, client: &Client) -
 
 fn bf_command(parser: &mut ParsedCommand, db: &mut Database, dbindex: usize) -> Response {
     validate_arguments_gte!(parser, 2);
+    // Dotted module syntax (BF.ADD key ...) is reshaped into the undotted
+    // layout (BF ADD key ...) that the body below assumes: a synthetic "bf"
+    // argument is prepended and the subcommand now points at the suffix
+    // after '.' inside argv[0].
+    if parser.get_str(0).map(|s| s.contains('.')).unwrap_or(false) {
+        let name = parser.get_str(0).unwrap_or_default().to_owned();
+        let dot = name.find('.').unwrap_or(0);
+        let (base_pos, base_len) = (parser.argv[0].pos, parser.argv[0].len);
+        let bf_arg = Argument { pos: base_pos, len: dot };
+        let sub_arg = Argument { pos: base_pos + dot + 1, len: base_len - dot - 1 };
+        parser.argv.insert(0, bf_arg);
+        parser.argv[1] = sub_arg;
+    }
     let subcommand = match parser.get_str(1) {
         Ok(s) => s.to_ascii_lowercase(),
         Err(_) => return Response::Error("ERR syntax error".to_owned()),
@@ -8206,6 +9063,17 @@ fn bf_command(parser: &mut ParsedCommand, db: &mut Database, dbindex: usize) -> 
 
 fn cf_command(parser: &mut ParsedCommand, db: &mut Database, dbindex: usize) -> Response {
     validate_arguments_gte!(parser, 2);
+    // Dotted module syntax (CF.ADD key ...) is reshaped into the undotted
+    // layout (CF ADD key ...) that the body below assumes.
+    if parser.get_str(0).map(|s| s.contains('.')).unwrap_or(false) {
+        let name = parser.get_str(0).unwrap_or_default().to_owned();
+        let dot = name.find('.').unwrap_or(0);
+        let (base_pos, base_len) = (parser.argv[0].pos, parser.argv[0].len);
+        let mod_arg = Argument { pos: base_pos, len: dot };
+        let sub_arg = Argument { pos: base_pos + dot + 1, len: base_len - dot - 1 };
+        parser.argv.insert(0, mod_arg);
+        parser.argv[1] = sub_arg;
+    }
     let subcommand = match parser.get_str(1) {
         Ok(s) => s.to_ascii_lowercase(),
         Err(_) => return Response::Error("ERR syntax error".to_owned()),
@@ -8339,6 +9207,17 @@ fn format_tdigest_double(v: f64) -> String {
 
 fn tdigest_command(parser: &mut ParsedCommand, db: &mut Database, dbindex: usize) -> Response {
     validate_arguments_gte!(parser, 2);
+    // Dotted module syntax (TDIGEST.ADD key ...) is reshaped into the
+    // undotted layout (TDIGEST ADD key ...) that the body below assumes.
+    if parser.get_str(0).map(|s| s.contains('.')).unwrap_or(false) {
+        let name = parser.get_str(0).unwrap_or_default().to_owned();
+        let dot = name.find('.').unwrap_or(0);
+        let (base_pos, base_len) = (parser.argv[0].pos, parser.argv[0].len);
+        let mod_arg = Argument { pos: base_pos, len: dot };
+        let sub_arg = Argument { pos: base_pos + dot + 1, len: base_len - dot - 1 };
+        parser.argv.insert(0, mod_arg);
+        parser.argv[1] = sub_arg;
+    }
     let subcommand = match parser.get_str(1) {
         Ok(s) => s.to_ascii_lowercase(),
         Err(_) => return Response::Error("ERR syntax error".to_owned()),
@@ -8640,6 +9519,17 @@ fn tdigest_command(parser: &mut ParsedCommand, db: &mut Database, dbindex: usize
 
 fn topk_command(parser: &mut ParsedCommand, db: &mut Database, dbindex: usize) -> Response {
     validate_arguments_gte!(parser, 2);
+    // Dotted module syntax (TOPK.ADD key ...) is reshaped into the undotted
+    // layout (TOPK ADD key ...) that the body below assumes.
+    if parser.get_str(0).map(|s| s.contains('.')).unwrap_or(false) {
+        let name = parser.get_str(0).unwrap_or_default().to_owned();
+        let dot = name.find('.').unwrap_or(0);
+        let (base_pos, base_len) = (parser.argv[0].pos, parser.argv[0].len);
+        let mod_arg = Argument { pos: base_pos, len: dot };
+        let sub_arg = Argument { pos: base_pos + dot + 1, len: base_len - dot - 1 };
+        parser.argv.insert(0, mod_arg);
+        parser.argv[1] = sub_arg;
+    }
     let subcommand = match parser.get_str(1) {
         Ok(s) => s.to_ascii_lowercase(),
         Err(_) => return Response::Error("ERR syntax error".to_owned()),
@@ -8813,6 +9703,21 @@ fn topk_command(parser: &mut ParsedCommand, db: &mut Database, dbindex: usize) -
 
 fn json_command(parser: &mut ParsedCommand, db: &mut Database, dbindex: usize) -> Response {
     validate_arguments_gte!(parser, 2);
+    // Two syntaxes are accepted:
+    //   dotted:   JSON.SET key path value   (module syntax, key at argv[1])
+    //   undotted: JSON SET key path value   (key at argv[2])
+    // The body below assumes the undotted layout, so dotted commands get
+    // their argv reshaped here: a synthetic "json" argument is prepended and
+    // the subcommand now points at the suffix after '.' inside argv[0].
+    if parser.get_str(0).map(|s| s.contains('.')).unwrap_or(false) {
+        let name = parser.get_str(0).unwrap_or_default().to_owned();
+        let dot = name.find('.').unwrap_or(0);
+        let (base_pos, base_len) = (parser.argv[0].pos, parser.argv[0].len);
+        let json_arg = Argument { pos: base_pos, len: dot };
+        let sub_arg = Argument { pos: base_pos + dot + 1, len: base_len - dot - 1 };
+        parser.argv.insert(0, json_arg);
+        parser.argv[1] = sub_arg;
+    }
     let subcommand = match parser.get_str(1) {
         Ok(s) => s.to_ascii_lowercase(),
         Err(_) => return Response::Error("ERR syntax error".to_owned()),
@@ -9229,9 +10134,10 @@ fn json_command(parser: &mut ParsedCommand, db: &mut Database, dbindex: usize) -
             let path = match parser.get_str(parser.argv.len() - 1) { Ok(p) => p.to_owned(), Err(_) => return Response::Error("ERR syntax error".to_owned()) };
             let mut results = Vec::new();
             for i in 2..parser.argv.len() - 1 {
-                let key = match parser.get_vec(i) { Ok(k) => k, Err(_) => continue };
-                match db.get(dbindex, &key) {
-                    Some(val) => match val.json_ref() {
+                let key = match parser.get_vec(i) { Ok(k) => k, Err(_) => { results.push(Response::Nil); continue } };
+                // Keys may live on different shards: read wherever hosted.
+                match cross_fetch(db, dbindex, &key) {
+                    Some((val, _)) => match val.json_ref() {
                         Ok(j) => match database::json::json_get(&j.value, &path) {
                             Some(v) => results.push(Response::Data(v.to_string().into_bytes())),
                             None => results.push(Response::Nil),
@@ -9546,6 +10452,17 @@ fn ft_command(parser: &mut ParsedCommand, db: &mut Database) -> Response {
 
 fn ts_command(parser: &mut ParsedCommand, db: &mut Database, dbindex: usize) -> Response {
     validate_arguments_gte!(parser, 2);
+    // Dotted module syntax (TS.ADD key ...) is reshaped into the undotted
+    // layout (TS ADD key ...) that the body below assumes.
+    if parser.get_str(0).map(|s| s.contains('.')).unwrap_or(false) {
+        let name = parser.get_str(0).unwrap_or_default().to_owned();
+        let dot = name.find('.').unwrap_or(0);
+        let (base_pos, base_len) = (parser.argv[0].pos, parser.argv[0].len);
+        let mod_arg = Argument { pos: base_pos, len: dot };
+        let sub_arg = Argument { pos: base_pos + dot + 1, len: base_len - dot - 1 };
+        parser.argv.insert(0, mod_arg);
+        parser.argv[1] = sub_arg;
+    }
     let subcommand = match parser.get_str(1) {
         Ok(s) => s.to_ascii_lowercase(),
         Err(_) => return Response::Error("ERR syntax error".to_owned()),
@@ -10242,6 +11159,8 @@ fn execute_command(
         "smismember" => smismember(parser, db, dbindex),
         "sintercard" => sintercard(parser, db, dbindex),
         "zmscore" => zmscore(parser, db, dbindex),
+        "zpopmin" => zpopmin(parser, db, dbindex),
+        "zpopmax" => zpopmax(parser, db, dbindex),
         "zrandmember" => zrandmember(parser, db, dbindex),
         "copy" => copy(parser, db, dbindex),
         "unlink" => unlink(parser, db, dbindex),
@@ -10279,6 +11198,10 @@ fn execute_command(
         "geohash" => geohash_cmd(parser, db, dbindex),
         "geopos" => geopos(parser, db, dbindex),
         "geosearch" => geosearch(parser, db, dbindex),
+        "georadius" => georadius(parser, db, dbindex),
+        "georadius_ro" => georadius_ro(parser, db, dbindex),
+        "georadiusbymember" => georadiusbymember(parser, db, dbindex),
+        "georadiusbymember_ro" => georadiusbymember_ro(parser, db, dbindex),
         "geosearchstore" => geosearchstore(parser, db, dbindex),
         // Phase 1.4: Hash per-field expiration
         "hexpire" => hexpire(parser, db, dbindex),
@@ -10302,6 +11225,14 @@ fn execute_command(
         "tdigest" => tdigest_command(parser, db, dbindex),
         "topk" => topk_command(parser, db, dbindex),
         "json" => json_command(parser, db, dbindex),
+        // Dotted module-syntax variants (JSON.SET, BF.ADD, ...) dispatch to
+        // the same handlers; each handler reshapes argv as needed.
+        cmd if cmd.starts_with("json.") => json_command(parser, db, dbindex),
+        cmd if cmd.starts_with("bf.") => bf_command(parser, db, dbindex),
+        cmd if cmd.starts_with("cf.") => cf_command(parser, db, dbindex),
+        cmd if cmd.starts_with("tdigest.") => tdigest_command(parser, db, dbindex),
+        cmd if cmd.starts_with("topk.") => topk_command(parser, db, dbindex),
+        cmd if cmd.starts_with("ts.") => ts_command(parser, db, dbindex),
         "ft" => ft_command(parser, db),
         "ts" => ts_command(parser, db, dbindex),
         cmd => Response::Error(format!("ERR unknown command \"{}\"", cmd)),

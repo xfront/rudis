@@ -261,22 +261,169 @@ impl Client {
     /// Determines the shard index for a parsed command.
     /// Routes by the first key argument for data commands,
     /// and uses shard 0 for pubsub/admin commands.
+    /// Multi-key commands route to the *minimum* shard of their keys so the
+    /// command implementation (which already holds that shard's lock) can
+    /// lock every other involved shard in ascending order, which is
+    /// deadlock-free (see ShardedDatabase::with_key_shards).
     fn shard_for_command(parsed: &parser::ParsedCommand, num_shards: usize) -> usize {
         if num_shards <= 1 {
             return 0;
         }
-        // Pubsub and admin commands go to shard 0 for consistency
-        if let Ok(cmd) = parsed.get_str(0) {
-            match cmd {
+        // Command names are case-insensitive in the protocol; lowercase them
+        // before matching (otherwise "PUBSUB" et al. would fall through and
+        // be routed by a non-key argument like "CHANNELS").
+        let cmd = match parsed.get_str(0) {
+            Ok(cmd) => cmd.to_ascii_lowercase(),
+            Err(_) => return 0,
+        };
+        {
+            // Pubsub and admin commands go to shard 0 for consistency
+            match cmd.as_str() {
                 "subscribe" | "unsubscribe" | "publish" | "psubscribe" | "punsubscribe"
                 | "ssubscribe" | "sunsubscribe" | "spublish"
                 | "pubsub" | "monitor" | "info" | "config" | "command" | "slowlog"
                 | "client" | "cluster" | "sentinel" | "latency" | "slaveof" | "replconf" | "wait"
-                | "sync" | "psync" | "asking" | "readonly" | "readwrite" | "debug"
+                | "sync" | "psync" | "asking" | "readonly" | "readwrite"
+                // ("debug" is handled below: DEBUG OBJECT routes by its key.)
                 | "flushall" | "save" | "bgsave" | "bgrewriteaof" | "shutdown"
                 | "lastsave" | "role" | "select" | "auth" | "ping" | "echo" | "quit"
-                | "time" | "reset" | "acl" | "function" | "fcall" | "fcall_ro" => return 0,
+                | "time" | "reset" | "acl" | "function" | "script"
+                // Whole-keyspace scans: their argument 1 is a pattern or a
+                // cursor, not a key, so hashing it would pick a random shard.
+                | "keys" | "scan" | "randomkey" | "dbsize" => return 0,
                 _ => {}
+            }
+            // Scripting commands: route by the first declared key
+            // (EVAL source numkeys key ... -> key sits at argument 3).
+            // Keyless scripts stay on shard 0.
+            if matches!(cmd.as_str(), "eval" | "evalsha" | "eval_ro" | "evalsha_ro"
+                | "fcall" | "fcall_ro")
+            {
+                if parsed.argv.len() > 3 {
+                    if let Ok(numkeys) = parsed.get_i64(2) {
+                        if numkeys > 0 {
+                            if let Ok(key) = parsed.get_vec(3) {
+                                return database::shard::ShardedDatabase::shard_for_key(&key)
+                                    % num_shards;
+                            }
+                        }
+                    }
+                }
+                return 0;
+            }
+            // XREAD/XREADGROUP: the keys come after the STREAMS keyword
+            // (everything before it is options), so argument 1 is not a key.
+            if cmd == "xread" || cmd == "xreadgroup" {
+                for i in 1..parsed.argv.len() {
+                    if let Ok(s) = parsed.get_str(i) {
+                        if s.eq_ignore_ascii_case("streams") {
+                            if i + 1 < parsed.argv.len() {
+                                if let Ok(key) = parsed.get_vec(i + 1) {
+                                    return database::shard::ShardedDatabase::shard_for_key(&key)
+                                        % num_shards;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+                return 0;
+            }
+            // JSON commands exist in two layouts: "json.set key ..." (module
+            // syntax, key at argument 1) and "json set key ..." (key at 2).
+            if cmd == "json" || cmd.starts_with("json.") {
+                let key_pos = if cmd == "json" { 2 } else { 1 };
+                if parsed.argv.len() > key_pos {
+                    if let Ok(key) = parsed.get_vec(key_pos) {
+                        return database::shard::ShardedDatabase::shard_for_key(&key) % num_shards;
+                    }
+                }
+                return 0;
+            }
+            // GEOSEARCHSTORE destination source ...: reads the source set and
+            // stores into the destination via the cross-shard store helper,
+            // so route by the *source* key (argument 2).
+            if cmd == "geosearchstore" {
+                if parsed.argv.len() > 2 {
+                    if let Ok(key) = parsed.get_vec(2) {
+                        return database::shard::ShardedDatabase::shard_for_key(&key) % num_shards;
+                    }
+                }
+                return 0;
+            }
+            // XGROUP/XINFO/OBJECT carry a subcommand at argument 1 and the
+            // key at argument 2 (HELP has no key and stays on shard 0).
+            if cmd == "xgroup" || cmd == "xinfo" || cmd == "object" {
+                if parsed.argv.len() > 2 {
+                    if let Ok(key) = parsed.get_vec(2) {
+                        return database::shard::ShardedDatabase::shard_for_key(&key) % num_shards;
+                    }
+                }
+                return 0;
+            }
+            // DEBUG OBJECT key: the key sits at argument 2 (other
+            // subcommands are keyless and stay on shard 0).
+            if cmd == "debug" {
+                if parsed.argv.len() > 2 {
+                    if let Ok(sub) = parsed.get_str(1) {
+                        if sub.eq_ignore_ascii_case("object") {
+                            if let Ok(key) = parsed.get_vec(2) {
+                                return database::shard::ShardedDatabase::shard_for_key(&key)
+                                    % num_shards;
+                            }
+                        }
+                    }
+                }
+                return 0;
+            }
+            // Bloom-filter commands: dotted "bf.add key ..." has the key at
+            // argument 1; undotted "bf add key ..." has it at argument 2.
+            if cmd == "bf" || cmd.starts_with("bf.") {
+                let key_pos = if cmd == "bf" { 2 } else { 1 };
+                if parsed.argv.len() > key_pos {
+                    if let Ok(key) = parsed.get_vec(key_pos) {
+                        return database::shard::ShardedDatabase::shard_for_key(&key) % num_shards;
+                    }
+                }
+                return 0;
+            }
+            // Cuckoo/TDigest/TopK/TimeSeries module commands follow the same
+            // two layouts as bloom filters: dotted "<mod>.add key ..." has the
+            // key at argument 1; undotted "<mod> add key ..." at argument 2.
+            if cmd == "cf"
+                || cmd.starts_with("cf.")
+                || cmd == "tdigest"
+                || cmd.starts_with("tdigest.")
+                || cmd == "topk"
+                || cmd.starts_with("topk.")
+                || cmd == "ts"
+                || cmd.starts_with("ts.")
+            {
+                let key_pos = if cmd.contains('.') { 1 } else { 2 };
+                if parsed.argv.len() > key_pos {
+                    if let Ok(key) = parsed.get_vec(key_pos) {
+                        return database::shard::ShardedDatabase::shard_for_key(&key) % num_shards;
+                    }
+                }
+                return 0;
+            }
+            // Multi-key commands: route to the minimum shard over all their
+            // key arguments. Must stay in sync with the command layer.
+            if let Some(positions) = Self::multi_key_positions(&cmd, parsed.argv.len()) {
+                let mut min: Option<usize> = None;
+                for pos in positions {
+                    if let Ok(key) = parsed.get_vec(pos) {
+                        let idx =
+                            database::shard::ShardedDatabase::shard_for_key(&key) % num_shards;
+                        min = Some(match min {
+                            Some(m) if m < idx => m,
+                            _ => idx,
+                        });
+                    }
+                }
+                if let Some(m) = min {
+                    return m;
+                }
             }
         }
         // Route by first key (argument 1)
@@ -284,6 +431,48 @@ impl Client {
             database::shard::ShardedDatabase::shard_for_key(&key) % num_shards
         } else {
             0
+        }
+    }
+
+    /// Argument positions that are keys for every multi-key command, or
+    /// `None` when the command operates on a single key. `argc` is the total
+    /// argument count (including the command name).
+    fn multi_key_positions(cmd: &str, argc: usize) -> Option<Vec<usize>> {
+        let range = |from: usize, to: usize| -> Vec<usize> {
+            (from..to.min(argc)).collect()
+        };
+        let numkeys_from = |name_pos: usize| -> Option<Vec<usize>> {
+            // <cmd> [numkeys at name_pos] key [key ...] [options...]
+            // The count is parsed by the command layer; here we assume every
+            // argument after the count up to a known option keyword is a key.
+            // To stay lenient, positions [name_pos+1 .. argc) are returned and
+            // non-key options are tolerated (hashing them only skews the min;
+            // the command layer still resolves every key individually).
+            Some(range(name_pos + 1, argc))
+        };
+        match cmd {
+            // key, value, key, value, ...
+            "mset" | "msetnx" => Some((1..argc).step_by(2).collect()),
+            // key, key, [key ...]
+            "mget" | "del" | "unlink" | "exists" | "touch"
+            | "sdiff" | "sinter" | "sunion"
+            | "sdiffstore" | "sinterstore" | "sunionstore"
+            | "pfmerge" | "pfcount" => Some(range(1, argc)),
+            // key, key
+            "rename" | "renamenx" | "copy" | "smove" | "rpoplpush" | "lmove" => {
+                Some(range(1, 3))
+            }
+            // op, dst, src, src, ...
+            "bitop" => Some(range(2, argc)),
+            // dst, numkeys, key [key ...] [WEIGHTS...] [AGGREGATE...]
+            "zunionstore" | "zinterstore" => Some(range(1, argc)),
+            // numkeys, key [key ...] [WEIGHTS...] [AGGREGATE...]
+            "zdiff" | "zunion" | "zinter" | "zintercard" => numkeys_from(1),
+            // dst, numkeys, key [key ...]
+            "zdiffstore" => Some(range(1, argc)),
+            // numkeys, key [key ...] [LIMIT limit]
+            "sintercard" => numkeys_from(1),
+            _ => None,
         }
     }
 
@@ -651,6 +840,9 @@ impl Server {
             thread::spawn(move || {
                 let mut shard_cursor = 0usize;
                 while hz_stop_rx.try_recv().is_err() {
+                    // Roll the ops/sec sampling window (like Redis's serverCron)
+                    // so INFO shows a fresh value even between commands.
+                    db_ref.stats.instantaneous_ops_per_sec();
                     // Run active expire cycle across all shards round-robin.
                     // Each tick processes one shard; the cursor advances so all
                     // shards get serviced within num_shards ticks.
