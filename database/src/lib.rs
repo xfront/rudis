@@ -39,6 +39,8 @@ use std::io::Write;
 use std::iter::FromIterator;
 use std::ops::RangeFull;
 use std::path::Path;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use std::sync::mpsc::Sender;
 
 use ahash::RandomState;
@@ -2292,6 +2294,120 @@ impl Value {
 
 type SenderMap<T> = HashMap<usize, Sender<T>>;
 
+/// Server-wide statistics shared across all shards of a `ShardedDatabase`.
+///
+/// Every counter is atomic so shards can record concurrently without locks,
+/// and the INFO command reads the aggregated values from any shard.
+#[derive(Default)]
+pub struct Stats {
+    /// Total accepted connections since startup.
+    pub total_connections_received: AtomicU64,
+    /// Currently connected clients.
+    pub connected_clients: AtomicI64,
+    /// Total commands processed since startup.
+    pub total_commands_processed: AtomicU64,
+    /// Successful lookups against existing keys.
+    pub keyspace_hits: AtomicU64,
+    /// Failed lookups against missing keys.
+    pub keyspace_misses: AtomicU64,
+    /// Keys removed lazily or by the active expire cycle.
+    pub expired_keys: AtomicU64,
+    /// Keys removed by maxmemory eviction.
+    pub evicted_keys: AtomicU64,
+    /// Connections dropped because maxclients was reached.
+    pub rejected_connections: AtomicU64,
+    /// Write commands since the last successful save.
+    pub rdb_changes_since_last_save: AtomicU64,
+    /// Historical maximum of used memory, in bytes.
+    pub used_memory_peak: AtomicU64,
+    /// Time of the last ops/sec sample, in milliseconds.
+    last_sample_mstime: AtomicI64,
+    /// Total commands at the time of the last ops/sec sample.
+    last_sample_commands: AtomicU64,
+    /// Cached ops/sec value between samples.
+    cached_ops_per_sec: AtomicI64,
+}
+
+impl Stats {
+    /// Creates a new shared statistics block.
+    pub fn new() -> Arc<Stats> {
+        Arc::new(Stats {
+            // Start the ops/sec sampling window at creation time, otherwise the
+            // first INFO would divide the command count by the whole Unix epoch.
+            last_sample_mstime: AtomicI64::new(mstime()),
+            ..Stats::default()
+        })
+    }
+
+    /// Records one processed command.
+    pub fn record_command(&self) {
+        self.total_commands_processed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records a write command (used for rdb_changes_since_last_save).
+    pub fn record_write(&self) {
+        self.rdb_changes_since_last_save
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records a successful key lookup.
+    pub fn record_hit(&self) {
+        self.keyspace_hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records a failed key lookup.
+    pub fn record_miss(&self) {
+        self.keyspace_misses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records an expired key removal.
+    pub fn record_expired(&self) {
+        self.expired_keys.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records an accepted client connection.
+    pub fn record_connection_opened(&self) {
+        self.total_connections_received
+            .fetch_add(1, Ordering::Relaxed);
+        self.connected_clients.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records a closed client connection.
+    pub fn record_connection_closed(&self) {
+        self.connected_clients.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// Tracks the historical maximum of used memory, in bytes, and returns it.
+    pub fn track_memory(&self, bytes: u64) -> u64 {
+        self.used_memory_peak.fetch_max(bytes, Ordering::Relaxed);
+        self.used_memory_peak.load(Ordering::Relaxed).max(bytes)
+    }
+
+    /// Approximates the operations per second with one-second sampling.
+    pub fn instantaneous_ops_per_sec(&self) -> i64 {
+        let now = mstime();
+        let total = self.total_commands_processed.load(Ordering::Relaxed);
+        let last_time = self.last_sample_mstime.load(Ordering::Relaxed);
+        if now - last_time >= 1000 {
+            let last_commands = self.last_sample_commands.load(Ordering::Relaxed);
+            let ops = ((total - last_commands) as i64 * 1000) / (now - last_time);
+            self.last_sample_mstime.store(now, Ordering::Relaxed);
+            self.last_sample_commands.store(total, Ordering::Relaxed);
+            self.cached_ops_per_sec.store(ops, Ordering::Relaxed);
+            ops
+        } else {
+            let cached = self.cached_ops_per_sec.load(Ordering::Relaxed);
+            if cached == 0 && total > 0 {
+                // No full one-second sample yet: approximate with the average
+                // rate since startup so the first INFO shows live traffic.
+                let elapsed = (now - last_time).max(1);
+                return (total as i64 * 1000) / elapsed;
+            }
+            cached
+        }
+    }
+}
+
 pub struct Database {
     pub config: Config,
 
@@ -2349,6 +2465,13 @@ pub struct Database {
     pub cluster: ClusterState,
     /// Sentinel state (Redis Sentinel). None when not in sentinel mode.
     pub sentinel: Option<SentinelState>,
+    /// Server-wide statistics. Shards of the same ShardedDatabase share one
+    /// instance, so every shard sees the aggregated counters.
+    pub stats: Arc<Stats>,
+    /// Weak link back to the ShardedDatabase this shard belongs to, together
+    /// with this shard's index. Used by admin commands (INFO/DBSIZE) to
+    /// aggregate keyspace data across shards. `None` for standalone databases.
+    pub sharded: Option<(Weak<shard::ShardedDatabase>, usize)>,
 }
 
 /// Information about a stored Lua function.
@@ -2453,6 +2576,8 @@ impl Database {
                 cluster_node_timeout,
             ),
             sentinel: None,
+            stats: Stats::new(),
+            sharded: None,
         }
     }
 
@@ -2464,6 +2589,12 @@ impl Database {
     /// Unlike `new()`, this doesn't change the working directory or create
     /// an AOF file. Each shard only uses database index 0.
     pub fn new_shard(_config: &Config) -> Self {
+        Database::new_shard_with_stats(_config, Stats::new())
+    }
+
+    /// Like `new_shard`, but the shard shares the given statistics block
+    /// with the other shards of a ShardedDatabase.
+    pub fn new_shard_with_stats(_config: &Config, stats: Arc<Stats>) -> Self {
         let mut data = Vec::with_capacity(1);
         let mut data_expiration_ms = Vec::with_capacity(1);
         let mut key_subscribers = Vec::with_capacity(1);
@@ -2506,6 +2637,8 @@ impl Database {
             search: SearchEngine::new(),
             cluster: ClusterState::new(false, "127.0.0.1".to_owned(), 0, "nodes.conf".to_owned(), 15000),
             sentinel: None,
+            stats,
+            sharded: None,
         }
     }
 
@@ -2538,6 +2671,80 @@ impl Database {
         self.data_expiration_ms[index].len()
     }
 
+    /// Returns the average remaining TTL, in milliseconds, of the keys in a
+    /// database that have an expiration set. Keys without expiration or
+    /// already expired are not considered.
+    pub fn avg_ttl(&self, index: usize) -> i64 {
+        let dict = &self.data_expiration_ms[index];
+        if dict.is_empty() {
+            return 0;
+        }
+        let now = mstime();
+        let mut sum = 0i64;
+        let mut count = 0i64;
+        for ttl in dict.values() {
+            let remaining = ttl - now;
+            if remaining > 0 {
+                sum += remaining;
+                count += 1;
+            }
+        }
+        if count == 0 {
+            0
+        } else {
+            sum / count
+        }
+    }
+
+    /// Returns `(keys, expires, total_remaining_ttl_ms, keys_with_ttl)` for a
+    /// database index of this database.
+    pub fn keyspace_summary(&self, index: usize) -> (usize, usize, i64, usize) {
+        let now = mstime();
+        let mut ttl_sum = 0i64;
+        let mut ttl_keys = 0usize;
+        for ttl in self.data_expiration_ms[index].values() {
+            let remaining = ttl - now;
+            if remaining > 0 {
+                ttl_sum += remaining;
+                ttl_keys += 1;
+            }
+        }
+        (
+            self.data[index].len(),
+            self.data_expiration_ms[index].len(),
+            ttl_sum,
+            ttl_keys,
+        )
+    }
+
+    /// Aggregated `(keys, expires, avg_ttl)` for one database index across all
+    /// shards of the owning ShardedDatabase. Falls back to this database's own
+    /// data when not linked to one.
+    ///
+    /// The caller (INFO/DBSIZE) holds the lock of its own shard, which is
+    /// skipped and replaced by this database's data; the remaining shards are
+    /// locked one at a time in increasing order, the same direction as
+    /// FLUSHALL, so it cannot deadlock with single-shard command execution.
+    pub fn aggregated_keyspace(&self, index: usize) -> (usize, usize, i64) {
+        let own = self.keyspace_summary(index);
+        let (keys, expires, ttl_sum, ttl_keys) = match &self.sharded {
+            Some((weak, my_shard_idx)) => match weak.upgrade() {
+                Some(sharded) => {
+                    let (k, e, s, c) = sharded.keyspace_stats_except(index, Some(*my_shard_idx));
+                    (k + own.0, e + own.1, s + own.2, c + own.3)
+                }
+                None => own,
+            },
+            None => own,
+        };
+        let avg = if ttl_keys > 0 {
+            ttl_sum / ttl_keys as i64
+        } else {
+            0
+        };
+        (keys, expires, avg)
+    }
+
     /// Gets a value from the database if exists and it is not expired.
     ///
     /// # Examples
@@ -2557,9 +2764,19 @@ impl Database {
     /// ```
     pub fn get(&self, index: usize, key: &[u8]) -> Option<&Value> {
         if self.is_expired(index, key) {
+            self.stats.record_miss();
             None
         } else {
-            self.data[index].get(key)
+            match self.data[index].get(key) {
+                Some(value) => {
+                    self.stats.record_hit();
+                    Some(value)
+                }
+                None => {
+                    self.stats.record_miss();
+                    None
+                }
+            }
         }
     }
 
@@ -2579,9 +2796,20 @@ impl Database {
     pub fn get_mut(&mut self, index: usize, key: &[u8]) -> Option<&mut Value> {
         if self.is_expired(index, key) {
             self.remove(index, key);
+            self.stats.record_expired();
+            self.stats.record_miss();
             None
         } else {
-            self.data[index].get_mut(key)
+            match self.data[index].get_mut(key) {
+                Some(value) => {
+                    self.stats.record_hit();
+                    Some(value)
+                }
+                None => {
+                    self.stats.record_miss();
+                    None
+                }
+            }
         }
     }
 
