@@ -12,6 +12,10 @@ use std::{
 use bitflags::bitflags;
 
 use compat::{getos, getpid};
+use database::cluster::{
+    self, ClusterState, NodeFlags, NodeRole, SlotState,
+    CLUSTER_SLOTS, NODE_ID_LEN,
+};
 use database::{zset, Database, PubsubEvent, Value};
 use parser::{Argument, OwnedParsedCommand, ParsedCommand};
 use response::{Response, ResponseError};
@@ -2643,6 +2647,10 @@ pub struct Client {
     pub rawsender: Sender<Option<Response>>,
     pub name: Vec<u8>,
     pub current_user: String,
+    /// ASKING flag: allow one access to a migrating slot.
+    pub asking: bool,
+    /// READONLY flag: allow reads from replica nodes in cluster mode.
+    pub readonly: bool,
 }
 
 impl Client {
@@ -2664,6 +2672,8 @@ impl Client {
             rawsender,
             name: vec![],
             current_user: "default".to_owned(),
+            asking: false,
+            readonly: false,
         }
     }
 }
@@ -2981,6 +2991,7 @@ fn command_properties(command_name: &str) -> CommandProperties {
         "watch" => (-2, fr | NOSCRIPT, 1, -1, 1),
         "unwatch" => (1, fr | NOSCRIPT, 0, 0, 0),
         "cluster" => (-2, ADMIN | READONLY, 0, 0, 0),
+        "sentinel" => (-2, ADMIN | READONLY, 0, 0, 0),
         "restore" => (-4, wm, 1, 1, 1),
         "restore-asking" => (-4, wm | ASKING, 1, 1, 1),
         "migrate" => (-6, WRITE, 0, 0, 0),
@@ -4572,27 +4583,310 @@ fn command_introspection(parser: &mut ParsedCommand, _db: &Database) -> Response
     }
 }
 
-// --- cluster command (stub) ---
+// --- cluster command ---
 
-fn cluster_command(parser: &mut ParsedCommand, _db: &Database) -> Response {
+fn cluster_command(parser: &mut ParsedCommand, db: &mut Database) -> Response {
     validate_arguments_gte!(parser, 2);
     let subcmd = try_validate!(parser.get_str(1), "ERR syntax error");
     match subcmd.to_ascii_lowercase().as_str() {
         "info" => {
-            let info = "cluster_enabled:0\r\ncluster_state:ok\r\ncluster_slots_assigned:0\r\ncluster_slots_ok:0\r\ncluster_slots_pfail:0\r\ncluster_slots_fail:0\r\ncluster_known_nodes:0\r\ncluster_size:0\r\ncluster_current_epoch:0\r\ncluster_my_epoch:0\r\ncluster_stats_messages_sent:0\r\ncluster_stats_messages_received:0\r\n";
-            Response::Data(info.as_bytes().to_vec())
+            let info = db.cluster.info_string();
+            Response::Data(info.into_bytes())
         }
-        "myid" => Response::Data(b"0000000000000000000000000000000000000000".to_vec()),
-        "nodes" => Response::Data(b"".to_vec()),
-        "slaves" => Response::Array(vec![]),
+        "nodes" => {
+            let nodes = db.cluster.nodes_string();
+            Response::Data(nodes.into_bytes())
+        }
+        "slots" => {
+            if !db.cluster.enabled {
+                return Response::Error("ERR This instance has cluster support disabled".to_owned());
+            }
+            let ranges = db.cluster.slots_array();
+            let mut result = Vec::new();
+            for (start, end, ip, port, _id) in ranges {
+                result.push(Response::Array(vec![
+                    Response::Integer(start as i64),
+                    Response::Integer(end as i64),
+                    Response::Array(vec![
+                        Response::Data(ip.into_bytes()),
+                        Response::Integer(port as i64),
+                    ]),
+                ]));
+            }
+            Response::Array(result)
+        }
+        "myid" => {
+            let id = cluster::node_id_to_hex(&db.cluster.my_id);
+            Response::Data(id.into_bytes())
+        }
+        "meet" => {
+            if !db.cluster.enabled {
+                return Response::Error("ERR This instance has cluster support disabled".to_owned());
+            }
+            if parser.argv.len() < 4 {
+                return Response::Error("ERR wrong number of arguments for 'cluster|meet' command".to_owned());
+            }
+            let ip = try_validate!(parser.get_str(2), "ERR syntax error").to_owned();
+            let port = try_validate!(parser.get_i64(3), "ERR value is not an integer") as u16;
+            let node_id = cluster::generate_node_id();
+            db.cluster.add_node(node_id, ip, port);
+            db.cluster.current_epoch += 1;
+            Response::Status("OK".to_owned())
+        }
+        "reset" => {
+            if !db.cluster.enabled {
+                return Response::Error("ERR This instance has cluster support disabled".to_owned());
+            }
+            let hard = if parser.argv.len() > 2 {
+                let opt = try_validate!(parser.get_str(2), "ERR syntax error");
+                opt.to_ascii_lowercase() == "hard"
+            } else {
+                false
+            };
+            match db.cluster.reset(hard) {
+                Ok(()) => Response::Status("OK".to_owned()),
+                Err(e) => Response::Error(e),
+            }
+        }
+        "addslots" => {
+            if !db.cluster.enabled {
+                return Response::Error("ERR This instance has cluster support disabled".to_owned());
+            }
+            if parser.argv.len() < 3 {
+                return Response::Error("ERR wrong number of arguments for 'cluster|addslots' command".to_owned());
+            }
+            for i in 2..parser.argv.len() {
+                let slot = try_validate!(parser.get_i64(i), "ERR value is not an integer") as usize;
+                if let Err(e) = db.cluster.add_slot(slot) {
+                    return Response::Error(e);
+                }
+            }
+            db.cluster.config_epoch += 1;
+            Response::Status("OK".to_owned())
+        }
+        "delslots" => {
+            if !db.cluster.enabled {
+                return Response::Error("ERR This instance has cluster support disabled".to_owned());
+            }
+            if parser.argv.len() < 3 {
+                return Response::Error("ERR wrong number of arguments for 'cluster|delslots' command".to_owned());
+            }
+            for i in 2..parser.argv.len() {
+                let slot = try_validate!(parser.get_i64(i), "ERR value is not an integer") as usize;
+                if let Err(e) = db.cluster.del_slot(slot) {
+                    return Response::Error(e);
+                }
+            }
+            Response::Status("OK".to_owned())
+        }
+        "setslot" => {
+            if !db.cluster.enabled {
+                return Response::Error("ERR This instance has cluster support disabled".to_owned());
+            }
+            if parser.argv.len() < 4 {
+                return Response::Error("ERR wrong number of arguments for 'cluster|setslot' command".to_owned());
+            }
+            let slot = try_validate!(parser.get_i64(2), "ERR value is not an integer") as usize;
+            let action = try_validate!(parser.get_str(3), "ERR syntax error");
+            match action.to_ascii_lowercase().as_str() {
+                "importing" => {
+                    if parser.argv.len() < 5 {
+                        return Response::Error("ERR wrong number of arguments for 'cluster|setslot|importing' command".to_owned());
+                    }
+                    let node_id = try_validate!(parser.get_str(4), "ERR syntax error");
+                    match db.cluster.set_slot_state(slot, SlotState::Importing(node_id.to_owned())) {
+                        Ok(()) => Response::Status("OK".to_owned()),
+                        Err(e) => Response::Error(e),
+                    }
+                }
+                "migrating" => {
+                    if parser.argv.len() < 5 {
+                        return Response::Error("ERR wrong number of arguments for 'cluster|setslot|migrating' command".to_owned());
+                    }
+                    let node_id = try_validate!(parser.get_str(4), "ERR syntax error");
+                    match db.cluster.set_slot_state(slot, SlotState::Migrating(node_id.to_owned())) {
+                        Ok(()) => Response::Status("OK".to_owned()),
+                        Err(e) => Response::Error(e),
+                    }
+                }
+                "stable" => {
+                    match db.cluster.set_slot_state(slot, SlotState::Stable) {
+                        Ok(()) => Response::Status("OK".to_owned()),
+                        Err(e) => Response::Error(e),
+                    }
+                }
+                "node" => {
+                    if parser.argv.len() < 5 {
+                        return Response::Error("ERR wrong number of arguments for 'cluster|setslot|node' command".to_owned());
+                    }
+                    let node_id_str = try_validate!(parser.get_str(4), "ERR syntax error");
+                    match cluster::hex_to_node_id(node_id_str) {
+                        Ok(node_id) => {
+                            if slot >= CLUSTER_SLOTS {
+                                return Response::Error(format!("ERR Invalid slot {}", slot));
+                            }
+                            // Clear old owner
+                            if let Some(old_owner) = db.cluster.slot_owners[slot] {
+                                if let Some(old_node) = db.cluster.nodes.get_mut(&old_owner) {
+                                    old_node.slots[slot] = false;
+                                }
+                            }
+                            // Set new owner
+                            db.cluster.slot_owners[slot] = Some(node_id);
+                            if let Some(node) = db.cluster.nodes.get_mut(&node_id) {
+                                node.slots[slot] = true;
+                                node.config_epoch = db.cluster.config_epoch;
+                            }
+                            db.cluster.my_slots[slot] = (node_id == db.cluster.my_id);
+                            db.cluster.set_slot_state(slot, SlotState::Stable).ok();
+                            db.cluster.recalc_size();
+                            Response::Status("OK".to_owned())
+                        }
+                        Err(e) => Response::Error(e),
+                    }
+                }
+                _ => Response::Error(format!("ERR Invalid CLUSTER SETSLOT action '{}'", action)),
+            }
+        }
         "keyslot" => {
             if parser.argv.len() < 3 {
                 return Response::Error("ERR wrong number of arguments for 'cluster|keyslot' command".to_owned());
             }
-            // Simple CRC16-based slot calculation (simplified)
             let key = try_validate!(parser.get_vec(2), "Invalid key");
             let slot = crc16_slot(&key);
             Response::Integer(slot as i64)
+        }
+        "countkeysinslot" => {
+            if !db.cluster.enabled {
+                return Response::Error("ERR This instance has cluster support disabled".to_owned());
+            }
+            if parser.argv.len() < 3 {
+                return Response::Error("ERR wrong number of arguments for 'cluster|countkeysinslot' command".to_owned());
+            }
+            let slot = try_validate!(parser.get_i64(2), "ERR value is not an integer") as usize;
+            if slot >= CLUSTER_SLOTS {
+                return Response::Error(format!("ERR Invalid slot {}", slot));
+            }
+            // Count keys in this shard's DB 0 that hash to this slot
+            let mut count = 0usize;
+            for (key, _) in db.iter_db(0) {
+                if crc16_slot(key) as usize == slot {
+                    count += 1;
+                }
+            }
+            Response::Integer(count as i64)
+        }
+        "getkeysinslot" => {
+            if !db.cluster.enabled {
+                return Response::Error("ERR This instance has cluster support disabled".to_owned());
+            }
+            if parser.argv.len() < 4 {
+                return Response::Error("ERR wrong number of arguments for 'cluster|getkeysinslot' command".to_owned());
+            }
+            let slot = try_validate!(parser.get_i64(2), "ERR value is not an integer") as usize;
+            let count = try_validate!(parser.get_i64(3), "ERR value is not an integer") as usize;
+            if slot >= CLUSTER_SLOTS {
+                return Response::Error(format!("ERR Invalid slot {}", slot));
+            }
+            let mut keys = Vec::new();
+            for (key, _) in db.iter_db(0) {
+                if crc16_slot(key) as usize == slot {
+                    keys.push(Response::Data(key.clone()));
+                    if keys.len() >= count {
+                        break;
+                    }
+                }
+            }
+            Response::Array(keys)
+        }
+        "slaves" | "replicas" => {
+            if !db.cluster.enabled {
+                return Response::Error("ERR This instance has cluster support disabled".to_owned());
+            }
+            if parser.argv.len() < 3 {
+                return Response::Error("ERR wrong number of arguments for 'cluster|replicas' command".to_owned());
+            }
+            let node_id_str = try_validate!(parser.get_str(2), "ERR syntax error");
+            match cluster::hex_to_node_id(node_id_str) {
+                Ok(node_id) => {
+                    let replicas: Vec<Response> = db.cluster.nodes.values()
+                        .filter(|n| n.replica_of == Some(node_id))
+                        .map(|n| {
+                            let id_hex = n.id_hex();
+                            let addr = format!("{}:{}@{}", n.ip, n.port, n.bus_port);
+                            let flags = format!("{}", n.flags);
+                            Response::Data(format!("{} {} {} 0 0 0 connected", id_hex, addr, flags).into_bytes())
+                        })
+                        .collect();
+                    Response::Array(replicas)
+                }
+                Err(e) => Response::Error(e),
+            }
+        }
+        "replicate" => {
+            if !db.cluster.enabled {
+                return Response::Error("ERR This instance has cluster support disabled".to_owned());
+            }
+            if parser.argv.len() < 3 {
+                return Response::Error("ERR wrong number of arguments for 'cluster|replicate' command".to_owned());
+            }
+            let node_id_str = try_validate!(parser.get_str(2), "ERR syntax error");
+            match cluster::hex_to_node_id(node_id_str) {
+                Ok(node_id) => {
+                    if !db.cluster.nodes.contains_key(&node_id) {
+                        return Response::Error("ERR Unknown node ID".to_owned());
+                    }
+                    db.cluster.role = NodeRole::Replica;
+                    db.cluster.replica_of = Some(node_id);
+                    db.cluster.flags = NodeFlags::Replica;
+                    Response::Status("OK".to_owned())
+                }
+                Err(e) => Response::Error(e),
+            }
+        }
+        "failover" => {
+            if !db.cluster.enabled {
+                return Response::Error("ERR This instance has cluster support disabled".to_owned());
+            }
+            // Simplified: just bump the config epoch
+            db.cluster.config_epoch += 1;
+            db.cluster.current_epoch = db.cluster.current_epoch.max(db.cluster.config_epoch);
+            Response::Status("OK".to_owned())
+        }
+        "saveconfig" => {
+            if !db.cluster.enabled {
+                return Response::Error("ERR This instance has cluster support disabled".to_owned());
+            }
+            match cluster::save_cluster_config(&db.cluster, &db.cluster.config_file.clone()) {
+                Ok(()) => Response::Status("OK".to_owned()),
+                Err(e) => Response::Error(e),
+            }
+        }
+        "forget" => {
+            if !db.cluster.enabled {
+                return Response::Error("ERR This instance has cluster support disabled".to_owned());
+            }
+            if parser.argv.len() < 3 {
+                return Response::Error("ERR wrong number of arguments for 'cluster|forget' command".to_owned());
+            }
+            let node_id_str = try_validate!(parser.get_str(2), "ERR syntax error");
+            match cluster::hex_to_node_id(node_id_str) {
+                Ok(node_id) => {
+                    if node_id == db.cluster.my_id {
+                        return Response::Error("ERR I tried hard but I can't forget myself".to_owned());
+                    }
+                    db.cluster.remove_node(&node_id);
+                    Response::Status("OK".to_owned())
+                }
+                Err(e) => Response::Error(e),
+            }
+        }
+        "flushslots" => {
+            if !db.cluster.enabled {
+                return Response::Error("ERR This instance has cluster support disabled".to_owned());
+            }
+            db.cluster.flush_slots();
+            Response::Status("OK".to_owned())
         }
         _ => Response::Error(format!("ERR Unknown CLUSTER subcommand '{}'", subcmd)),
     }
@@ -4643,6 +4937,229 @@ static CRC16_TABLE: [u16; 256] = {
     table
 };
 
+// --- sentinel command ---
+
+fn sentinel_command(parser: &mut ParsedCommand, db: &mut Database) -> Response {
+    validate_arguments_gte!(parser, 2);
+    // Ensure sentinel state exists
+    if db.sentinel.is_none() {
+        db.sentinel = Some(database::sentinel::SentinelState::new());
+    }
+    let subcmd = try_validate!(parser.get_str(1), "ERR syntax error");
+    match subcmd.to_ascii_lowercase().as_str() {
+        "myid" => {
+            let id = db.sentinel.as_ref().unwrap().sentinel_id_hex();
+            Response::Data(id.into_bytes())
+        }
+        "ping" => Response::Status("PONG".to_owned()),
+        "masters" => {
+            let sentinel = db.sentinel.as_ref().unwrap();
+            let mut result = Vec::new();
+            for master in sentinel.masters.values() {
+                let info = database::sentinel::SentinelState::master_info_string(master);
+                result.push(Response::Data(info.into_bytes()));
+            }
+            Response::Array(result)
+        }
+        "master" => {
+            if parser.argv.len() < 3 {
+                return Response::Error("ERR wrong number of arguments for 'sentinel|master' command".to_owned());
+            }
+            let name = try_validate!(parser.get_str(2), "ERR syntax error");
+            let sentinel = db.sentinel.as_ref().unwrap();
+            match sentinel.get_master(name) {
+                Some(master) => {
+                    let info = database::sentinel::SentinelState::master_info_string(master);
+                    Response::Data(info.into_bytes())
+                }
+                None => Response::Error(format!("ERR No such master name '{}'", name)),
+            }
+        }
+        "replicas" | "slaves" => {
+            if parser.argv.len() < 3 {
+                return Response::Error("ERR wrong number of arguments for 'sentinel|replicas' command".to_owned());
+            }
+            let name = try_validate!(parser.get_str(2), "ERR syntax error");
+            let sentinel = db.sentinel.as_ref().unwrap();
+            match sentinel.get_master(name) {
+                Some(master) => {
+                    let replicas: Vec<Response> = master.replicas.iter().map(|r| {
+                        Response::Data(format!(
+                            "ip={}:port={}:state={}:master-link-status={}",
+                            r.ip, r.port, r.state, if r.master_link_status { "up" } else { "down" }
+                        ).into_bytes())
+                    }).collect();
+                    Response::Array(replicas)
+                }
+                None => Response::Error(format!("ERR No such master name '{}'", name)),
+            }
+        }
+        "sentinels" => {
+            if parser.argv.len() < 3 {
+                return Response::Error("ERR wrong number of arguments for 'sentinel|sentinels' command".to_owned());
+            }
+            let name = try_validate!(parser.get_str(2), "ERR syntax error");
+            let sentinel = db.sentinel.as_ref().unwrap();
+            if !sentinel.masters.contains_key(name) {
+                return Response::Error(format!("ERR No such master name '{}'", name));
+            }
+            // Return known sentinels for this master
+            let sentinels = sentinel.known_sentinels.get(name).cloned().unwrap_or_default();
+            let result: Vec<Response> = sentinels.iter().map(|s| {
+                Response::Data(format!("ip={}:port={}:run_id={}", s.ip, s.port, s.run_id).into_bytes())
+            }).collect();
+            Response::Array(result)
+        }
+        "get-master-addr-by-name" => {
+            if parser.argv.len() < 3 {
+                return Response::Error("ERR wrong number of arguments for 'sentinel|get-master-addr-by-name' command".to_owned());
+            }
+            let name = try_validate!(parser.get_str(2), "ERR syntax error");
+            let sentinel = db.sentinel.as_ref().unwrap();
+            match sentinel.get_master(name) {
+                Some(master) => Response::Array(vec![
+                    Response::Data(master.ip.as_bytes().to_vec()),
+                    Response::Integer(master.port as i64),
+                ]),
+                None => Response::Nil,
+            }
+        }
+        "monitor" => {
+            // SENTINEL MONITOR name ip port quorum
+            if parser.argv.len() < 6 {
+                return Response::Error("ERR wrong number of arguments for 'sentinel|monitor' command".to_owned());
+            }
+            let name = try_validate!(parser.get_str(2), "ERR syntax error").to_owned();
+            let ip = try_validate!(parser.get_str(3), "ERR syntax error").to_owned();
+            let port = try_validate!(parser.get_i64(4), "ERR value is not an integer") as u16;
+            let quorum = try_validate!(parser.get_i64(5), "ERR value is not an integer") as u32;
+            db.sentinel.as_mut().unwrap().add_master(name, ip, port, quorum);
+            Response::Status("OK".to_owned())
+        }
+        "remove" => {
+            if parser.argv.len() < 3 {
+                return Response::Error("ERR wrong number of arguments for 'sentinel|remove' command".to_owned());
+            }
+            let name = try_validate!(parser.get_str(2), "ERR syntax error");
+            if db.sentinel.as_mut().unwrap().remove_master(name) {
+                Response::Status("OK".to_owned())
+            } else {
+                Response::Error(format!("ERR No such master name '{}'", name))
+            }
+        }
+        "set" => {
+            // SENTINEL SET name option value [option value ...]
+            if parser.argv.len() < 5 {
+                return Response::Error("ERR wrong number of arguments for 'sentinel|set' command".to_owned());
+            }
+            let name = try_validate!(parser.get_str(2), "ERR syntax error").to_owned();
+            let sentinel = db.sentinel.as_mut().unwrap();
+            if !sentinel.masters.contains_key(&name) {
+                return Response::Error(format!("ERR No such master name '{}'", name));
+            }
+            let mut i = 3;
+            while i + 1 < parser.argv.len() {
+                let option = try_validate!(parser.get_str(i), "ERR syntax error");
+                let value = try_validate!(parser.get_str(i + 1), "ERR syntax error");
+                if let Some(master) = sentinel.masters.get_mut(&name) {
+                    match option.to_ascii_lowercase().as_str() {
+                        "down-after-milliseconds" => {
+                            master.down_after_ms = value.parse().unwrap_or(30000);
+                        }
+                        "failover-timeout" => {
+                            master.failover_timeout = value.parse().unwrap_or(180000);
+                        }
+                        "parallel-syncs" => {
+                            master.parallel_syncs = value.parse().unwrap_or(1);
+                        }
+                        "quorum" => {
+                            master.quorum = value.parse().unwrap_or(2);
+                        }
+                        _ => {}
+                    }
+                }
+                i += 2;
+            }
+            Response::Status("OK".to_owned())
+        }
+        "ckquorum" => {
+            if parser.argv.len() < 3 {
+                return Response::Error("ERR wrong number of arguments for 'sentinel|ckquorum' command".to_owned());
+            }
+            let name = try_validate!(parser.get_str(2), "ERR syntax error");
+            let sentinel = db.sentinel.as_ref().unwrap();
+            match sentinel.get_master(name) {
+                Some(master) => {
+                    // Simplified: just check if quorum > 0
+                    if master.quorum > 0 {
+                        Response::Status("OK".to_owned())
+                    } else {
+                        Response::Error("ERR quorum is 0".to_owned())
+                    }
+                }
+                None => Response::Error(format!("ERR No such master name '{}'", name)),
+            }
+        }
+        "failover" => {
+            if parser.argv.len() < 3 {
+                return Response::Error("ERR wrong number of arguments for 'sentinel|failover' command".to_owned());
+            }
+            let name = try_validate!(parser.get_str(2), "ERR syntax error");
+            let sentinel = db.sentinel.as_mut().unwrap();
+            match sentinel.get_master_mut(name) {
+                Some(master) => {
+                    master.failover_in_progress = true;
+                    master.failover_epoch += 1;
+                    Response::Status("OK".to_owned())
+                }
+                None => Response::Error(format!("ERR No such master name '{}'", name)),
+            }
+        }
+        "reset" => {
+            if parser.argv.len() < 3 {
+                return Response::Error("ERR wrong number of arguments for 'sentinel|reset' command".to_owned());
+            }
+            let pattern = try_validate!(parser.get_str(2), "ERR syntax error");
+            let count = db.sentinel.as_mut().unwrap().reset_pattern(pattern);
+            Response::Integer(count as i64)
+        }
+        "info" => {
+            let sentinel = db.sentinel.as_ref().unwrap();
+            let info = format!(
+                "sentinel_masters:{}\r\nsentinel_runid:{}\r\nsentinel_tilt:0\r\n",
+                sentinel.masters.len(),
+                sentinel.run_id,
+            );
+            Response::Data(info.into_bytes())
+        }
+        "is-master-down-by-addr" => {
+            // SENTINEL IS-MASTER-DOWN-BY-ADDR ip port runid mstime
+            if parser.argv.len() < 6 {
+                return Response::Error("ERR wrong number of arguments for 'sentinel|is-master-down-by-addr' command".to_owned());
+            }
+            let ip = try_validate!(parser.get_str(2), "ERR syntax error");
+            let port = try_validate!(parser.get_i64(3), "ERR value is not an integer") as u16;
+            // Check if we're monitoring this master and it's down
+            let sentinel = db.sentinel.as_ref().unwrap();
+            let mut is_down = 0i64;
+            for master in sentinel.masters.values() {
+                if master.ip == ip && master.port == port && master.state != database::sentinel::MasterState::Ok {
+                    is_down = 1;
+                    break;
+                }
+            }
+            // Return: is_down, leader_runid, leader_epoch
+            let leader = "*";
+            Response::Array(vec![
+                Response::Integer(is_down),
+                Response::Data(leader.as_bytes().to_vec()),
+                Response::Integer(0),
+            ])
+        }
+        _ => Response::Error(format!("ERR Unknown SENTINEL subcommand '{}'", subcmd)),
+    }
+}
+
 // --- latency command (stub) ---
 
 fn latency_command(parser: &mut ParsedCommand, _db: &Database) -> Response {
@@ -4660,14 +5177,25 @@ fn latency_command(parser: &mut ParsedCommand, _db: &Database) -> Response {
 
 // --- replication stubs ---
 
-fn slaveof_command(parser: &mut ParsedCommand, _db: &Database) -> Response {
+fn slaveof_command(parser: &mut ParsedCommand, db: &mut Database) -> Response {
     validate_arguments_exact!(parser, 3);
     let host = try_validate!(parser.get_str(1), "ERR syntax error");
-    let port = try_validate!(parser.get_str(2), "ERR syntax error");
-    if host.to_ascii_lowercase() == "no" && port.to_ascii_lowercase() == "one" {
+    let port_str = try_validate!(parser.get_str(2), "ERR syntax error");
+    if host.to_ascii_lowercase() == "no" && port_str.to_ascii_lowercase() == "one" {
+        // Promote to master
+        db.cluster.role = NodeRole::Master;
+        db.cluster.replica_of = None;
+        db.cluster.flags = NodeFlags::Myself;
         Response::Status("OK".to_owned())
     } else {
-        Response::Error("ERR SLAVEOF is not supported".to_owned())
+        let port = try_validate!(port_str.parse::<u16>(), "ERR value is not an integer");
+        // In cluster mode, use REPLICAOF to set up replication
+        let node_id = cluster::generate_node_id();
+        db.cluster.add_node(node_id, host.to_owned(), port);
+        db.cluster.role = NodeRole::Replica;
+        db.cluster.replica_of = Some(node_id);
+        db.cluster.flags = NodeFlags::Replica;
+        Response::Status("OK".to_owned())
     }
 }
 
@@ -4693,18 +5221,21 @@ fn psync_command(_parser: &mut ParsedCommand, _db: &Database) -> Response {
     Response::Error("ERR PSYNC is not supported".to_owned())
 }
 
-fn asking_command(parser: &mut ParsedCommand, _db: &Database) -> Response {
+fn asking_command(parser: &mut ParsedCommand, client: &mut Client) -> Response {
     validate_arguments_exact!(parser, 1);
+    client.asking = true;
     Response::Status("OK".to_owned())
 }
 
-fn readonly_command(parser: &mut ParsedCommand, _db: &Database) -> Response {
+fn readonly_command(parser: &mut ParsedCommand, client: &mut Client) -> Response {
     validate_arguments_exact!(parser, 1);
+    client.readonly = true;
     Response::Status("OK".to_owned())
 }
 
-fn readwrite_command(parser: &mut ParsedCommand, _db: &Database) -> Response {
+fn readwrite_command(parser: &mut ParsedCommand, client: &mut Client) -> Response {
     validate_arguments_exact!(parser, 1);
+    client.readonly = false;
     Response::Status("OK".to_owned())
 }
 
@@ -9222,13 +9753,88 @@ fn execute_command(
     if command_name == "select" {
         opt_validate!(parser.argv.len() == 2, "Wrong number of parameters");
         let dbindex = try_opt_validate!(parser.get_i64(1), "Invalid dbindex") as usize;
-        if dbindex > db.config.databases as usize {
+        if dbindex >= db.config.databases as usize {
             return Ok(Response::Error("ERR invalid DB index".to_owned()));
         }
         client.dbindex = dbindex;
         return Ok(Response::Status("OK".to_owned()));
     }
     let dbindex = client.dbindex;
+
+    // Cluster redirect check (MOVED / ASK)
+    if db.cluster.enabled {
+        let dominated_commands = [
+            "ping", "echo", "auth", "cluster", "asking", "readonly", "readwrite",
+            "info", "config", "command", "client", "slowlog", "latency",
+            "subscribe", "unsubscribe", "psubscribe", "punsubscribe",
+            "publish", "spublish", "ssubscribe", "sunsubscribe",
+            "multi", "exec", "discard", "watch", "unwatch",
+            "select", "quit", "reset", "monitor", "shutdown",
+            "save", "bgsave", "bgrewriteaof", "lastsave", "debug",
+            "slaveof", "replconf", "wait", "sync", "psync",
+            "acl", "function", "script",
+        ];
+        let is_admin = dominated_commands.contains(&command_name);
+        if !is_admin {
+            // Get the first key from the command to compute slot
+            let props = command_properties(command_name);
+            if props.first_key_index > 0 && parser.argv.len() > props.first_key_index as usize {
+                if let Ok(key) = parser.get_vec(props.first_key_index as usize) {
+                    let slot = crc16_slot(&key) as usize;
+                    // Check ASKING flag first
+                    if client.asking {
+                        client.asking = false;
+                        // Allow this one command through regardless of slot state
+                    } else if db.cluster.role == NodeRole::Replica && !client.readonly {
+                        // Replica nodes reject writes unless READONLY is set
+                        if let Some(owner) = db.cluster.get_slot_owner(slot) {
+                            let addr = format!("{}:{}", owner.ip, owner.port);
+                            return Ok(Response::Error(format!("MOVED {} {}", slot, addr)));
+                        }
+                    } else {
+                        // Check slot ownership
+                        match &db.cluster.slot_owners[slot] {
+                            Some(owner_id) if *owner_id != db.cluster.my_id => {
+                                // Slot owned by another node
+                                if let Some(owner) = db.cluster.nodes.get(owner_id) {
+                                    let addr = format!("{}:{}", owner.ip, owner.port);
+                                    return Ok(Response::Error(format!("MOVED {} {}", slot, addr)));
+                                }
+                            }
+                            None => {
+                                // Slot not assigned to any node
+                                // In a real cluster this would be an error, but we allow it
+                                // for single-node cluster setups
+                            }
+                            _ => {
+                                // Slot owned by us, check migration state
+                                match &db.cluster.slot_states[slot] {
+                                    SlotState::Migrating(target_id) => {
+                                        // Check if key exists locally
+                                        if db.get(dbindex, &key).is_none() {
+                                            // Key not here, redirect ASK
+                                            if let Ok(target_nid) = cluster::hex_to_node_id(target_id) {
+                                                if let Some(target) = db.cluster.nodes.get(&target_nid) {
+                                                    let addr = format!("{}:{}", target.ip, target.port);
+                                                    return Ok(Response::Error(format!("ASK {} {}", slot, addr)));
+                                                }
+                                            }
+                                        }
+                                    }
+                                    SlotState::Importing(_) => {
+                                        // Importing slot without ASKING -> MOVED to actual owner
+                                        // (This is handled by the asking check above)
+                                    }
+                                    SlotState::Stable => {}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     Ok(match command_name {
         "pexpireat" => pexpireat(parser, db, dbindex),
         "pexpire" => pexpire(parser, db, dbindex),
@@ -9402,15 +10008,16 @@ fn execute_command(
         "slowlog" => slowlog_command(parser, db),
         "command" => command_introspection(parser, db),
         "cluster" => cluster_command(parser, db),
+        "sentinel" => sentinel_command(parser, db),
         "latency" => latency_command(parser, db),
         "slaveof" => slaveof_command(parser, db),
         "replconf" => replconf_command(parser, db),
         "wait" => wait_command(parser, db),
         "sync" => sync_command(parser, db),
         "psync" => psync_command(parser, db),
-        "asking" => asking_command(parser, db),
-        "readonly" => readonly_command(parser, db),
-        "readwrite" => readwrite_command(parser, db),
+        "asking" => asking_command(parser, client),
+        "readonly" => readonly_command(parser, client),
+        "readwrite" => readwrite_command(parser, client),
         "restore" => restore_command(parser, db),
         "restore-asking" => restore_command(parser, db),
         "migrate" => migrate_command(parser, db),
