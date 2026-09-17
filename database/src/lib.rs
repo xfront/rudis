@@ -2326,6 +2326,8 @@ pub struct Stats {
     last_sample_commands: AtomicU64,
     /// Cached ops/sec value between samples.
     cached_ops_per_sec: AtomicI64,
+    /// Time of the last processed command, used to detect recent activity.
+    last_command_mstime: AtomicI64,
 }
 
 impl Stats {
@@ -2342,6 +2344,8 @@ impl Stats {
     /// Records one processed command.
     pub fn record_command(&self) {
         self.total_commands_processed.fetch_add(1, Ordering::Relaxed);
+        self.last_command_mstime
+            .store(mstime(), Ordering::Relaxed);
     }
 
     /// Records a write command (used for rdb_changes_since_last_save).
@@ -2384,27 +2388,32 @@ impl Stats {
     }
 
     /// Approximates the operations per second with one-second sampling.
+    /// Also called periodically by the hz thread so the cached value stays
+    /// fresh even when no command arrives (like Redis's serverCron).
     pub fn instantaneous_ops_per_sec(&self) -> i64 {
         let now = mstime();
         let total = self.total_commands_processed.load(Ordering::Relaxed);
         let last_time = self.last_sample_mstime.load(Ordering::Relaxed);
-        if now - last_time >= 1000 {
+        let elapsed = now - last_time;
+        if elapsed >= 1000 {
             let last_commands = self.last_sample_commands.load(Ordering::Relaxed);
-            let ops = ((total - last_commands) as i64 * 1000) / (now - last_time);
+            // Ceiling division so brief bursts remain visible (>= 1 ops/sec).
+            let ops = ((total - last_commands) as i64 * 1000 + elapsed - 1) / elapsed;
             self.last_sample_mstime.store(now, Ordering::Relaxed);
             self.last_sample_commands.store(total, Ordering::Relaxed);
             self.cached_ops_per_sec.store(ops, Ordering::Relaxed);
-            ops
-        } else {
-            let cached = self.cached_ops_per_sec.load(Ordering::Relaxed);
-            if cached == 0 && total > 0 {
-                // No full one-second sample yet: approximate with the average
-                // rate since startup so the first INFO shows live traffic.
-                let elapsed = (now - last_time).max(1);
-                return (total as i64 * 1000) / elapsed;
-            }
-            cached
+            return ops;
         }
+        let cached = self.cached_ops_per_sec.load(Ordering::Relaxed);
+        if cached == 0
+            && total > 0
+            && now - self.last_command_mstime.load(Ordering::Relaxed) < 1000
+        {
+            // Commands just arrived but the sampling window has not rolled
+            // yet: report the burst instead of a stale zero.
+            return ((total as i64 * 1000) + elapsed.max(1) - 1) / elapsed.max(1);
+        }
+        cached
     }
 }
 
@@ -2595,22 +2604,30 @@ impl Database {
     /// Like `new_shard`, but the shard shares the given statistics block
     /// with the other shards of a ShardedDatabase.
     pub fn new_shard_with_stats(_config: &Config, stats: Arc<Stats>) -> Self {
-        let mut data = Vec::with_capacity(1);
-        let mut data_expiration_ms = Vec::with_capacity(1);
-        let mut key_subscribers = Vec::with_capacity(1);
-        let mut watched_keys = Vec::with_capacity(1);
-        data.push(FastMap::default());
-        data_expiration_ms.push(FastMap::default());
-        key_subscribers.push(FastMap::default());
-        watched_keys.push(HashMap::new());
+        // Every shard hosts all logical databases of the config: keys are
+        // partitioned across shards, and each shard keeps one data map per
+        // database index so SELECT 0..N-1 work everywhere.
+        let size = _config.databases as usize;
+        let mut data = Vec::with_capacity(size);
+        let mut data_expiration_ms = Vec::with_capacity(size);
+        let mut key_subscribers = Vec::with_capacity(size);
+        let mut watched_keys = Vec::with_capacity(size);
+        for _ in 0..size {
+            data.push(FastMap::default());
+            data_expiration_ms.push(FastMap::default());
+            key_subscribers.push(FastMap::default());
+            watched_keys.push(HashMap::new());
+        }
 
         Database {
             config: {
                 let mut config = Config::default(0, Logger::new(Level::Warning));
-                // Each shard only serves database index 0, so `databases` must
-                // match the single data map created above. Leaving the default
-                // (16) makes INFO/SELECT/MOVE/FLUSHALL index out of bounds.
-                config.databases = 1;
+                // Keep the configured number of logical databases so SELECT,
+                // FLUSHALL, INFO keyspace and expire cycles match the data
+                // maps created above. Mismatching the two (databases = 1 with
+                // 16 configured, or vice versa) causes index-out-of-bounds
+                // panics or rejects valid SELECT commands.
+                config.databases = _config.databases;
                 config
             },
             data,
@@ -2795,8 +2812,8 @@ impl Database {
     /// ```
     pub fn get_mut(&mut self, index: usize, key: &[u8]) -> Option<&mut Value> {
         if self.is_expired(index, key) {
+            // `remove` records the expiration itself.
             self.remove(index, key);
-            self.stats.record_expired();
             self.stats.record_miss();
             None
         } else {
@@ -2830,6 +2847,7 @@ impl Database {
         let mut r = self.data[index].remove(key);
         if self.is_expired(index, key) {
             r = None;
+            self.stats.record_expired();
         }
 
         self.data_expiration_ms[index].remove(key);

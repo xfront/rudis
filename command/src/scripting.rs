@@ -4,7 +4,27 @@
 
 use mlua::prelude::*;
 use response::Response;
+use database::shard::ShardedDatabase;
 use database::{Database, LuaFunctionInfo};
+
+/// Redis-cluster semantics: every key a Lua script touches must live on the
+/// shard the script itself was routed to (EVAL routes by KEYS[1]). This keeps
+/// `redis.call` writes consistent with what outside clients read back.
+fn lua_check_local_keys(db: &Database, keys: &[&[u8]]) -> Result<(), Response> {
+    if let Some((weak, my_shard)) = &db.sharded {
+        if let Some(sharded) = weak.upgrade() {
+            let num_shards = sharded.num_shards();
+            for key in keys {
+                if ShardedDatabase::shard_for_key(key) % num_shards != *my_shard {
+                    return Err(Response::Error(
+                        "ERR Lua script attempted to access a non local key".to_owned(),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
 
 /// Compute a hex hash string for script caching.
 /// Uses a simple hash (not cryptographic SHA1) but sufficient for script caching.
@@ -293,6 +313,20 @@ fn lua_execute_command(db: &mut Database, dbindex: usize, args: &[Vec<u8>]) -> R
         return Response::Error("ERR no command".to_owned());
     }
     let cmd = String::from_utf8_lossy(&args[0]).to_ascii_lowercase();
+    // Enforce the local-key rule before touching data. `keys` operates on the
+    // whole keyspace of the current shard and declares no keys.
+    if cmd != "keys" {
+        let keys: Vec<&[u8]> = if cmd == "del" || cmd == "exists" {
+            args[1..].iter().map(|v| v.as_slice()).collect()
+        } else if args.len() > 1 {
+            vec![args[1].as_slice()]
+        } else {
+            Vec::new()
+        };
+        if let Err(e) = lua_check_local_keys(db, &keys) {
+            return e;
+        }
+    }
     match cmd.as_str() {
         "get" => lua_cmd_get(db, dbindex, args),
         "set" => lua_cmd_set(db, dbindex, args),

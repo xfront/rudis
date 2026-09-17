@@ -215,92 +215,15 @@ impl ValueSortedSet {
         }
     }
 
-    fn rangebyscore(&self, min: Bound<f64>, max: Bound<f64>) -> Vec<&SortedSetMember> {
-        let skiplist = match *self {
-            ValueSortedSet::Data(ref skiplist, _) => skiplist,
-        };
-        let mut f1 = SortedSetMember::new(0.0, vec![]);
-        let mut f2 = SortedSetMember::new(0.0, vec![]);
-        let m1 = match min {
-            Bound::Included(f) => {
-                f1.set_f64(f);
-                Bound::Included(&f1)
-            }
-            Bound::Excluded(f) => {
-                f1.set_f64(f);
-                f1.set_upper_boundary(true);
-                Bound::Excluded(&f1)
-            }
-            Bound::Unbounded => Bound::Unbounded,
-        };
-
-        let m2 = match max {
-            Bound::Included(f) => {
-                f2.set_f64(f);
-                f2.set_upper_boundary(true);
-                Bound::Included(&f2)
-            }
-            Bound::Excluded(f) => {
-                f2.set_f64(f);
-                Bound::Excluded(&f2)
-            }
-            Bound::Unbounded => Bound::Unbounded,
-        };
-
-        if f1 > f2 {
-            return vec![];
-        }
-        skiplist.range((m1, m2)).collect::<Vec<_>>()
-    }
-
     pub fn zcount(&self, min: Bound<f64>, max: Bound<f64>) -> usize {
-        self.rangebyscore(min, max).len()
-    }
-
-    fn rangebylex(&self, min: Bound<Vec<u8>>, max: Bound<Vec<u8>>) -> Vec<&SortedSetMember> {
-        let skiplist = match *self {
-            ValueSortedSet::Data(ref skiplist, _) => skiplist,
-        };
-
-        if skiplist.is_empty() {
-            return vec![];
-        }
-
-        let f = skiplist.first().unwrap().get_f64();
-        let mut f1 = SortedSetMember::new(*f, vec![]);
-        let mut f2 = SortedSetMember::new(*f, vec![]);
-        let m1 = match min {
-            Bound::Included(f) => {
-                f1.set_vec(f);
-                Bound::Included(&f1)
-            }
-            Bound::Excluded(f) => {
-                f1.set_vec(f);
-                Bound::Excluded(&f1)
-            }
-            Bound::Unbounded => Bound::Unbounded,
-        };
-
-        let m2 = match max {
-            Bound::Included(f) => {
-                f2.set_vec(f);
-                Bound::Included(&f2)
-            }
-            Bound::Excluded(f) => {
-                f2.set_vec(f);
-                Bound::Excluded(&f2)
-            }
-            Bound::Unbounded => Bound::Unbounded,
-        };
-
-        if f1 > f2 {
-            return vec![];
-        }
-        skiplist.range((m1, m2)).collect::<Vec<_>>()
+        // Delegate to `zrangebyscore`, whose bound handling also copes with
+        // unbounded ranges (the old dedicated path misjudged them).
+        self.zrangebyscore(min, max, false, 0, usize::MAX, false).len()
     }
 
     pub fn zlexcount(&self, min: Bound<Vec<u8>>, max: Bound<Vec<u8>>) -> usize {
-        self.rangebylex(min, max).len()
+        // Delegate to `zrangebylex`, which sorts the members lexicographically.
+        self.zrangebylex(min, max, 0, usize::MAX, false).len()
     }
 
     pub fn zrem(&mut self, member: Vec<u8>) -> bool {
@@ -334,19 +257,14 @@ impl ValueSortedSet {
     }
 
     pub fn zremrangebylex(&mut self, min: Bound<Vec<u8>>, max: Bound<Vec<u8>>) -> usize {
-        let pos = match min {
-            Bound::Included(ref s) => self.zlexcount(Bound::Unbounded, Bound::Excluded(s.clone())),
-            Bound::Excluded(ref s) => self.zlexcount(Bound::Unbounded, Bound::Included(s.clone())),
-            Bound::Unbounded => 0,
-        };
-        let count = self.zlexcount(min, max);
-        let (skiplist, hmap) = match *self {
-            ValueSortedSet::Data(ref mut skiplist, ref mut hmap) => (skiplist, hmap),
-        };
-
-        for _ in 0..count {
-            let el = skiplist.remove(pos);
-            hmap.remove(&el.s);
+        // Collect the members in range first (lexicographic order, independent
+        // of scores), then remove them one by one.
+        let members = self.zrangebylex(min, max, 0, usize::MAX, false);
+        let mut count = 0;
+        for member in members {
+            if self.zrem(member) {
+                count += 1;
+            }
         }
         count
     }
@@ -569,47 +487,52 @@ impl ValueSortedSet {
         count: usize,
         rev: bool,
     ) -> Vec<Vec<u8>> {
-        let skiplist = match *self {
-            ValueSortedSet::Data(ref skiplist, _) => skiplist,
+        let hashmap = match *self {
+            ValueSortedSet::Data(_, ref hashmap) => hashmap,
         };
 
-        let f = skiplist.first().unwrap().get_f64();
-
-        // FIXME: duplicated code from ZCOUNT. Trying to create a factory
-        // function for this, but I failed because allocation was going
-        // out of scope.
-        // Probably more function will copy this until I can figure out
-        // a better way.
-        let mut f1 = SortedSetMember::new(*f, vec![]);
-        let mut f2 = SortedSetMember::new(*f, vec![]);
+        // ZRANGEBYLEX orders members lexicographically, independently of
+        // their scores, so work on a byte-sorted snapshot of the names.
+        let mut members: Vec<Vec<u8>> = hashmap.keys().cloned().collect();
+        members.sort();
 
         let (min, max) = if rev { (_max, _min) } else { (_min, _max) };
 
-        let m1 = match min {
-            Bound::Included(f) => {
-                f1.set_vec(f);
-                Bound::Included(&f1)
-            }
-            Bound::Excluded(f) => {
-                f1.set_vec(f);
-                Bound::Excluded(&f1)
-            }
-            Bound::Unbounded => Bound::Unbounded,
+        let start = match min {
+            Bound::Included(f) => members.iter().position(|m| m.as_slice() >= f.as_slice()),
+            Bound::Excluded(f) => members.iter().position(|m| m.as_slice() > f.as_slice()),
+            Bound::Unbounded => Some(0),
         };
 
-        let m2 = match max {
-            Bound::Included(f) => {
-                f2.set_vec(f);
-                Bound::Included(&f2)
-            }
-            Bound::Excluded(f) => {
-                f2.set_vec(f);
-                Bound::Excluded(&f2)
-            }
-            Bound::Unbounded => Bound::Unbounded,
+        let end = match max {
+            Bound::Included(f) => members
+                .iter()
+                .rposition(|m| m.as_slice() <= f.as_slice())
+                .map(|p| p + 1),
+            Bound::Excluded(f) => members
+                .iter()
+                .rposition(|m| m.as_slice() < f.as_slice())
+                .map(|p| p + 1),
+            Bound::Unbounded => Some(members.len()),
         };
 
-        self.range(m1, m2, false, offset, count, rev)
+        let (start, end) = match (start, end) {
+            (Some(s), Some(e)) if s < e => (s, e),
+            _ => return Vec::new(),
+        };
+
+        let range = &members[start..end];
+        if rev {
+            range
+                .iter()
+                .rev()
+                .skip(offset)
+                .take(count)
+                .cloned()
+                .collect()
+        } else {
+            range.iter().skip(offset).take(count).cloned().collect()
+        }
     }
 
     pub fn zrank(&self, el: Vec<u8>) -> Option<usize> {

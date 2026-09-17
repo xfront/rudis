@@ -9,7 +9,7 @@ crc64 = "2.0"
 rand = "0.8"
 skiplist = "1.1"
 basichll = "0.3"
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["preserve_order"] }
 
 [dependencies.config]
 path = "../config"

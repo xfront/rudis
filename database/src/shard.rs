@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use crc64::crc64;
 
-use crate::{Database, Stats};
+use crate::{Database, Stats, Value};
 
 /// Default number of shards per database index.
 /// Dragonfly uses one shard per thread; we use a fixed count that can be
@@ -86,6 +86,9 @@ impl ShardedDatabase {
     /// Aggregates `(keys, expires, ttl_sum, ttl_keys)` for one database index
     /// across all shards, optionally skipping one shard (the one whose lock is
     /// already held by the caller, which passes its own data instead).
+    ///
+    /// Logical database `db_index` lives in each shard's Database data maps,
+    /// so this iterates the single shard layer and reads data map `db_index`.
     pub fn keyspace_stats_except(
         &self,
         db_index: usize,
@@ -95,7 +98,7 @@ impl ShardedDatabase {
         let mut expires = 0usize;
         let mut ttl_sum = 0i64;
         let mut ttl_keys = 0usize;
-        for (shard_idx, shard) in self.shards[db_index].iter().enumerate() {
+        for (shard_idx, shard) in self.shards[0].iter().enumerate() {
             if Some(shard_idx) == except {
                 continue;
             }
@@ -109,6 +112,192 @@ impl ShardedDatabase {
         (keys, expires, ttl_sum, ttl_keys)
     }
 
+    /// Clears every logical database on all shards except one (whose lock is
+    /// already held by the caller, which clears itself afterwards).
+    pub fn clearall_except(&self, except: Option<usize>) {
+        for (shard_idx, shard) in self.shards[0].iter().enumerate() {
+            if Some(shard_idx) == except {
+                continue;
+            }
+            let mut shard = shard.lock().unwrap();
+            shard.db.clearall();
+        }
+    }
+
+    /// Clears one logical database on all shards except one (whose lock is
+    /// already held by the caller, which clears itself afterwards).
+    pub fn clear_db_except(&self, db_index: usize, except: Option<usize>) {
+        for (shard_idx, shard) in self.shards[0].iter().enumerate() {
+            if Some(shard_idx) == except {
+                continue;
+            }
+            let mut shard = shard.lock().unwrap();
+            shard.db.clear(db_index);
+        }
+    }
+
+    /// Collects keys matching `pattern` in logical database `db_index` across
+    /// all shards except one (the caller's own shard, whose lock is already
+    /// held and which appends its own matches afterwards).
+    pub fn keys_except(&self, db_index: usize, pattern: &[u8], except: Option<usize>) -> Vec<Vec<u8>> {
+        let mut keys = Vec::new();
+        for (shard_idx, shard) in self.shards[0].iter().enumerate() {
+            if Some(shard_idx) == except {
+                continue;
+            }
+            let shard = shard.lock().unwrap();
+            keys.extend(shard.db.keys(db_index, pattern));
+        }
+        keys
+    }
+
+    /// Snapshot of all keys in logical database `db_index` on every shard
+    /// except one (the caller's own shard, whose lock is already held and
+    /// which appends its own keys afterwards). Used by SCAN and RANDOMKEY.
+    pub fn data_keys_except(&self, db_index: usize, except: Option<usize>) -> Vec<Vec<u8>> {
+        let mut keys = Vec::new();
+        for (shard_idx, shard) in self.shards[0].iter().enumerate() {
+            if Some(shard_idx) == except {
+                continue;
+            }
+            let shard = shard.lock().unwrap();
+            keys.extend(shard.db.data_keys(db_index).into_iter().cloned());
+        }
+        keys
+    }
+
+    /// Locks the shard hosting `key` and reads its value plus expiration.
+    /// Used by cross-shard key commands (RENAME/COPY/...); the caller must
+    /// not invoke this for a key hosted by its own shard (its lock is already
+    /// held and the read would deadlock): check with `shard_of` first.
+    pub fn read_with_ttl(&self, db_index: usize, key: &[u8]) -> Option<(Value, Option<i64>)> {
+        let idx = Self::shard_for_key(key) % self.num_shards;
+        let mut shard = self.shards[0][idx].lock().unwrap();
+        let value = shard.db.get(db_index, key).cloned()?;
+        let expiration = shard.db.get_msexpiration(db_index, key).copied();
+        Some((value, expiration))
+    }
+
+    /// Returns `true` if `key` is hosted by `my_shard`.
+    pub fn is_own_shard(&self, key: &[u8], my_shard: usize) -> bool {
+        Self::shard_for_key(key) % self.num_shards == my_shard
+    }
+
+    /// Buckets `keys` by their hosting shard (ascending, the caller's own
+    /// `my_shard` excluded) and, for each bucket, locks the shard and calls
+    /// `f` with it and the positions (into `keys`) of the keys it hosts.
+    ///
+    /// Callers route multi-key commands to the *minimum* shard of their keys
+    /// (see networking), so every locked shard here has a higher index than
+    /// the one already held: locks are always taken in ascending order and
+    /// no deadlock is possible. Buckets are processed one at a time; each
+    /// lock is released before the next is taken.
+    pub fn with_key_shards<F, R>(
+        &self,
+        db_index: usize,
+        my_shard: Option<usize>,
+        keys: &[&[u8]],
+        mut f: F,
+    ) -> Vec<(usize, R)>
+    where
+        F: FnMut(&mut Shard, &[usize]) -> R,
+    {
+        let mut buckets: Vec<(usize, Vec<usize>)> = Vec::new();
+        for (pos, key) in keys.iter().enumerate() {
+            let idx = Self::shard_for_key(key) % self.num_shards;
+            if Some(idx) == my_shard {
+                continue;
+            }
+            match buckets.iter_mut().find(|(i, _)| *i == idx) {
+                Some((_, positions)) => positions.push(pos),
+                None => buckets.push((idx, vec![pos])),
+            }
+        }
+        buckets.sort_by_key(|(idx, _)| *idx);
+
+        let mut results = Vec::with_capacity(buckets.len());
+        for (idx, positions) in &buckets {
+            let mut shard = self.shards[0][*idx].lock().unwrap();
+            results.push((*idx, f(&mut shard, positions)));
+        }
+        results
+    }
+
+    /// Reads owned clones of the values under `keys` from every shard except
+    /// `my_shard` (whose keys the caller reads through its own `Database`).
+    /// Returns one entry per key position; entries for keys hosted by
+    /// `my_shard` stay `None`.
+    pub fn read_values_except(
+        &self,
+        db_index: usize,
+        my_shard: Option<usize>,
+        keys: &[&[u8]],
+    ) -> Vec<Option<Value>> {
+        let mut out: Vec<Option<Value>> = vec![None; keys.len()];
+        self.with_key_shards(db_index, my_shard, keys, |shard, positions| {
+            for &p in positions {
+                out[p] = shard.db.get(db_index, keys[p]).cloned();
+            }
+        });
+        out
+    }
+
+    /// Writes `value` (with an optional expiration) under `key`, on whichever
+    /// shard hosts it. Returns `false` (and writes nothing) when the key is
+    /// hosted by `my_shard`: the caller must write those through its own
+    /// already-locked `Database`.
+    pub fn write_value(
+        &self,
+        db_index: usize,
+        my_shard: Option<usize>,
+        key: &[u8],
+        value: Value,
+        msexpiration: Option<i64>,
+    ) -> bool {
+        if let Some(my) = my_shard {
+            if self.is_own_shard(key, my) {
+                return false;
+            }
+        }
+        let mut value = Some(value);
+        self.with_key_shards(db_index, my_shard, &[key], |shard, _| {
+            shard.db.remove_msexpiration(db_index, key);
+            *shard.db.get_or_create(db_index, key) = value.take().unwrap();
+            if let Some(exp) = msexpiration {
+                shard.db.set_msexpiration(db_index, key.to_vec(), exp);
+            }
+            shard.db.key_updated(db_index, key);
+            true
+        });
+        true
+    }
+
+    /// Removes `key` (and its expiration) from whichever shard hosts it.
+    /// Returns `false` when the key is hosted by `my_shard` (the caller
+    /// removes those locally); otherwise whether the key existed.
+    pub fn remove_key(
+        &self,
+        db_index: usize,
+        my_shard: Option<usize>,
+        key: &[u8],
+    ) -> bool {
+        if let Some(my) = my_shard {
+            if self.is_own_shard(key, my) {
+                return false;
+            }
+        }
+        let mut existed = false;
+        self.with_key_shards(db_index, my_shard, &[key], |shard, _| {
+            existed = shard.db.remove(db_index, key).is_some();
+            shard.db.remove_msexpiration(db_index, key);
+            if existed {
+                shard.db.key_updated(db_index, key);
+            }
+            true
+        });
+        existed
+    }
+
     /// Creates a new ShardedDatabase with the default number of shards.
     pub fn new(config: &config::Config) -> Self {
         Self::with_shards(config, DEFAULT_SHARDS_PER_DB)
@@ -116,7 +305,11 @@ impl ShardedDatabase {
 
     /// Creates a new ShardedDatabase with a specified number of shards.
     pub fn with_shards(config: &config::Config, num_shards: usize) -> Self {
-        let num_databases = config.databases as usize;
+        // The outer dimension is the database index, but every command goes
+        // through shard 0 of this layer: logical databases are carried by the
+        // per-shard Database's own data maps (one per configured database).
+        // Keep a single layer here to avoid hosting unused Database instances.
+        let num_databases = 1;
         let mut shards = Vec::with_capacity(num_databases);
         let stats = Stats::new();
 
@@ -247,7 +440,8 @@ mod tests {
         let config = test_config();
         let sharded = ShardedDatabase::with_shards(&config, 4);
         assert_eq!(sharded.num_shards(), 4);
-        assert_eq!(sharded.num_databases(), 16);
+        // One shard layer: logical databases live inside each shard's Database.
+        assert_eq!(sharded.num_databases(), 1);
     }
 
     #[test]
