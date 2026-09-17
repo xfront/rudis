@@ -88,6 +88,15 @@ pub struct Config {
     pub zset_max_ziplist_entries: usize,
     pub zset_max_ziplist_value: usize,
     pub hll_sparse_max_bytes: usize,
+    // Cluster
+    pub cluster_enabled: bool,
+    pub cluster_config_file: String,
+    pub cluster_node_timeout: u64,
+    pub cluster_migration_barrier: u32,
+    pub cluster_allow_replica_migration: bool,
+    pub cluster_replica_validity_factor: u32,
+    // Sentinel
+    pub sentinel_mode: bool,
     // Other
     pub client_output_buffer_limit: String,
     pub aof_rewrite_incremental_fsync: bool,
@@ -126,6 +135,30 @@ fn read_bool(args: Vec<Vec<u8>>) -> Result<bool, ConfigError> {
         "no" => false,
         _ => return Err(ConfigError::InvalidFormat),
     })
+}
+
+/// Parses a size value with an optional binary unit suffix (Redis style):
+/// "64mb" -> 67108864, "1kb" -> 1024, "512" -> 512.
+fn parse_mem_size(s: &str) -> Option<usize> {
+    let lower = s.to_ascii_lowercase();
+    let (num, multiplier) = if let Some(n) = lower.strip_suffix("gb") {
+        (n, 1024 * 1024 * 1024)
+    } else if let Some(n) = lower.strip_suffix("mb") {
+        (n, 1024 * 1024)
+    } else if let Some(n) = lower.strip_suffix("kb") {
+        (n, 1024)
+    } else if let Some(n) = lower.strip_suffix('g') {
+        (n, 1024 * 1024 * 1024)
+    } else if let Some(n) = lower.strip_suffix('m') {
+        (n, 1024 * 1024)
+    } else if let Some(n) = lower.strip_suffix('k') {
+        (n, 1024)
+    } else if let Some(n) = lower.strip_suffix('b') {
+        (n, 1)
+    } else {
+        (lower.as_str(), 1)
+    };
+    num.parse::<usize>().ok().map(|n| n * multiplier)
 }
 
 impl Config {
@@ -199,6 +232,15 @@ impl Config {
             zset_max_ziplist_entries: 128,
             zset_max_ziplist_value: 64,
             hll_sparse_max_bytes: 3000,
+            // Cluster
+            cluster_enabled: false,
+            cluster_config_file: "nodes.conf".to_owned(),
+            cluster_node_timeout: 15000,
+            cluster_migration_barrier: 1,
+            cluster_allow_replica_migration: true,
+            cluster_replica_validity_factor: 10,
+            // Sentinel
+            sentinel_mode: false,
             // Other
             client_output_buffer_limit: "normal 0 0 0 slave 256mb 64mb 60 pubsub 32mb 8mb 60"
                 .to_owned(),
@@ -225,6 +267,7 @@ impl Config {
                 return Err(ConfigError::FileNotFound);
             }
         });
+        let mut client_output_buffer_limit_seen = false;
         for line_iter in file.lines() {
             let lline = line_iter?;
             let line = lline.trim();
@@ -343,7 +386,11 @@ impl Config {
                 b"appendfsync" => self.appendfsync = read_string(args)?.to_owned(),
                 b"no-appendfsync-on-rewrite" => self.no_appendfsync_on_rewrite = read_bool(args)?,
                 b"auto-aof-rewrite-percentage" => self.auto_aof_rewrite_percentage = read_parse(args)?,
-                b"auto-aof-rewrite-min-size" => self.auto_aof_rewrite_min_size = read_parse(args)?,
+                b"auto-aof-rewrite-min-size" => {
+                    let s = read_string(args)?;
+                    self.auto_aof_rewrite_min_size =
+                        parse_mem_size(&s).ok_or(ConfigError::InvalidParameter)?;
+                }
                 // Misc
                 b"lua-time-limit" => self.lua_time_limit = read_parse(args)?,
                 b"slowlog-log-slower-than" => self.slowlog_log_slower_than = read_parse(args)?,
@@ -359,8 +406,40 @@ impl Config {
                 b"zset-max-ziplist-value" => self.zset_max_ziplist_value = read_parse(args)?,
                 b"hll-sparse-max-bytes" => self.hll_sparse_max_bytes = read_parse(args)?,
                 // Other
-                b"client-output-buffer-limit" => self.client_output_buffer_limit = read_string(args)?.to_owned(),
+                // Multiple directives accumulate the three classes (normal,
+                // slave, pubsub) into a single space-separated string. The
+                // first directive replaces the built-in default value.
+                b"client-output-buffer-limit" => {
+                    let mut parts: Vec<String> = args[1..]
+                        .iter()
+                        .map(|a| from_utf8(a).map(|s| s.to_owned()))
+                        .collect::<Result<_, _>>()?;
+                    if client_output_buffer_limit_seen
+                        && !self.client_output_buffer_limit.is_empty()
+                    {
+                        parts.insert(0, self.client_output_buffer_limit.clone());
+                    }
+                    self.client_output_buffer_limit = parts.join(" ");
+                    client_output_buffer_limit_seen = true;
+                }
+                // Accepted for compatibility with Redis configuration files;
+                // rudis does not implement upstart/systemd supervision.
+                b"supervised" => {
+                    read_string(args)?;
+                }
+                // Redis 4+ list tuning directives; rudis still exposes the
+                // legacy list-max-ziplist-entries/value pair instead.
+                b"list-max-ziplist-size" | b"list-compress-depth" => {
+                    read_string(args)?;
+                }
                 b"aof-rewrite-incremental-fsync" => self.aof_rewrite_incremental_fsync = read_bool(args)?,
+                // Cluster
+                b"cluster-enabled" => self.cluster_enabled = read_bool(args)?,
+                b"cluster-config-file" => self.cluster_config_file = read_string(args)?,
+                b"cluster-node-timeout" => self.cluster_node_timeout = read_parse(args)?,
+                b"cluster-migration-barrier" => self.cluster_migration_barrier = read_parse(args)?,
+                b"cluster-allow-replica-migration" => self.cluster_allow_replica_migration = read_bool(args)?,
+                b"cluster-replica-validity-factor" => self.cluster_replica_validity_factor = read_parse(args)?,
                 b"include" => {
                     if args.len() != 2 {
                         return Err(ConfigError::InvalidFormat);
@@ -550,5 +629,46 @@ mod tests {
             Logger::new(Level::Warning)
         );
         assert_eq!(config.requirepass, Some("THISISASTRONGPASSWORD".to_owned()));
+    }
+
+    #[test]
+    fn parse_supervised() {
+        // Accepted for Redis compatibility and ignored.
+        let config = config!(b"supervised no", Logger::new(Level::Warning));
+        assert!(!config.daemonize);
+    }
+
+    #[test]
+    fn parse_client_output_buffer_limit() {
+        let config = config!(
+            b"client-output-buffer-limit normal 0 0 0\
+              \nclient-output-buffer-limit slave 256mb 64mb 60\
+              \nclient-output-buffer-limit pubsub 32mb 8mb 60",
+            Logger::new(Level::Warning)
+        );
+        assert_eq!(
+            config.client_output_buffer_limit,
+            "normal 0 0 0 slave 256mb 64mb 60 pubsub 32mb 8mb 60"
+        );
+    }
+
+    #[test]
+    fn parse_mem_size_units() {
+        assert_eq!(parse_mem_size("512"), Some(512));
+        assert_eq!(parse_mem_size("1kb"), Some(1024));
+        assert_eq!(parse_mem_size("64mb"), Some(64 * 1024 * 1024));
+        assert_eq!(parse_mem_size("64MB"), Some(64 * 1024 * 1024));
+        assert_eq!(parse_mem_size("2gb"), Some(2 * 1024 * 1024 * 1024));
+        assert_eq!(parse_mem_size("abc"), None);
+    }
+
+    #[test]
+    fn parse_sample_config_file() {
+        // The shipped rudis.conf must parse without errors.
+        let path = format!("{}/../rudis.conf", env!("CARGO_MANIFEST_DIR"));
+        let mut config = Config::new(Logger::new(Level::Warning));
+        config.parsefile(path).unwrap();
+        assert_eq!(config.auto_aof_rewrite_min_size, 64 * 1024 * 1024);
+        assert_eq!(config.databases, 16);
     }
 }

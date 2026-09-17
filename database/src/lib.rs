@@ -15,6 +15,7 @@ extern crate util;
 
 pub mod acl;
 pub mod bloom;
+pub mod cluster;
 pub mod dbutil;
 pub mod error;
 pub mod geo;
@@ -22,6 +23,7 @@ pub mod hash;
 pub mod json;
 pub mod list;
 pub mod search;
+pub mod sentinel;
 pub mod shard;
 pub mod set;
 pub mod stream;
@@ -52,7 +54,9 @@ use util::{get_random_hex_chars, glob_match, mstime};
 type FastMap<K, V> = HashMap<K, V, RandomState>;
 
 use acl::Acl;
+use cluster::ClusterState;
 use error::OperationError;
+use sentinel::SentinelState;
 use list::ValueList;
 use bloom::{BloomFilter, CuckooFilter, TDigest, TopK};
 use hash::ValueHash;
@@ -2376,6 +2380,10 @@ pub struct Database {
     pub lua_functions: HashMap<String, LuaFunctionInfo>,
     /// Full-text search engine (RediSearch).
     pub search: SearchEngine,
+    /// Cluster state (Redis Cluster).
+    pub cluster: ClusterState,
+    /// Sentinel state (Redis Sentinel). None when not in sentinel mode.
+    pub sentinel: Option<SentinelState>,
 }
 
 /// Information about a stored Lua function.
@@ -2441,6 +2449,13 @@ impl Database {
             None
         };
 
+        // Extract cluster config before moving config
+        let cluster_enabled = config.cluster_enabled;
+        let cluster_ip = if config.bind.is_empty() { "127.0.0.1".to_owned() } else { config.bind[0].clone() };
+        let cluster_port = config.port;
+        let cluster_config_file = config.cluster_config_file.clone();
+        let cluster_node_timeout = config.cluster_node_timeout;
+
         Database {
             config,
             data,
@@ -2465,6 +2480,14 @@ impl Database {
             script_cache: HashMap::new(),
             lua_functions: HashMap::new(),
             search: SearchEngine::new(),
+            cluster: ClusterState::new(
+                cluster_enabled,
+                cluster_ip,
+                cluster_port,
+                cluster_config_file,
+                cluster_node_timeout,
+            ),
+            sentinel: None,
         }
     }
 
@@ -2486,7 +2509,14 @@ impl Database {
         watched_keys.push(HashMap::new());
 
         Database {
-            config: Config::default(0, Logger::new(Level::Warning)),
+            config: {
+                let mut config = Config::default(0, Logger::new(Level::Warning));
+                // Each shard only serves database index 0, so `databases` must
+                // match the single data map created above. Leaving the default
+                // (16) makes INFO/SELECT/MOVE/FLUSHALL index out of bounds.
+                config.databases = 1;
+                config
+            },
             data,
             data_expiration_ms,
             subscribers: HashMap::new(),
@@ -2509,6 +2539,8 @@ impl Database {
             script_cache: HashMap::new(),
             lua_functions: HashMap::new(),
             search: SearchEngine::new(),
+            cluster: ClusterState::new(false, "127.0.0.1".to_owned(), 0, "nodes.conf".to_owned(), 15000),
+            sentinel: None,
         }
     }
 

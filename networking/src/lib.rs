@@ -26,6 +26,8 @@ use logger::Level;
 use parser::{OwnedParsedCommand, ParseError, Parser};
 use response::{Response, ResponseError};
 
+pub mod cluster_bus;
+
 /// A stream connection.
 #[cfg(unix)]
 enum Stream {
@@ -191,6 +193,14 @@ pub struct Server {
     pub next_id: Arc<AtomicUsize>,
     /// Sender to signal hz thread to stop
     hz_stop: Option<Sender<()>>,
+    /// Cluster bus stop flag
+    cluster_bus_stop: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Cluster bus listener thread
+    cluster_bus_handle: Option<thread::JoinHandle<()>>,
+    /// Gossip timer stop flag
+    gossip_stop: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Gossip timer thread
+    gossip_handle: Option<thread::JoinHandle<()>>,
 }
 
 impl Client {
@@ -261,7 +271,7 @@ impl Client {
                 "subscribe" | "unsubscribe" | "publish" | "psubscribe" | "punsubscribe"
                 | "ssubscribe" | "sunsubscribe" | "spublish"
                 | "pubsub" | "monitor" | "info" | "config" | "command" | "slowlog"
-                | "client" | "cluster" | "latency" | "slaveof" | "replconf" | "wait"
+                | "client" | "cluster" | "sentinel" | "latency" | "slaveof" | "replconf" | "wait"
                 | "sync" | "psync" | "asking" | "readonly" | "readwrite" | "debug"
                 | "flushall" | "save" | "bgsave" | "bgrewriteaof" | "shutdown"
                 | "lastsave" | "role" | "select" | "auth" | "ping" | "echo" | "quit"
@@ -490,6 +500,10 @@ impl Server {
             listener_threads: Vec::new(),
             next_id: Arc::new(AtomicUsize::default()),
             hz_stop: None,
+            cluster_bus_stop: None,
+            cluster_bus_handle: None,
+            gossip_stop: None,
+            gossip_handle: None,
         }
     }
 
@@ -651,6 +665,39 @@ impl Server {
                 }
             }
         }
+
+        // Start cluster bus if cluster mode is enabled
+        if self.config.cluster_enabled {
+            // Register self in the cluster state
+            {
+                let mut shard = self.db.shard_write(0, 0).unwrap();
+                shard.db.cluster.register_self();
+                // Try to load existing cluster config
+                let config_file = shard.db.cluster.config_file.clone();
+                if std::path::Path::new(&config_file).exists() {
+                    let _ = database::cluster::load_cluster_config(&mut shard.db.cluster, &config_file);
+                    log!(self.config.logger, Notice, "Loaded cluster config from {}", config_file);
+                }
+            }
+
+            let bus_port = self.config.port.saturating_add(10000);
+            let (bus_handle, bus_stop) = cluster_bus::start_cluster_bus(
+                bus_port,
+                self.db.clone(),
+                self.config.logger.clone(),
+            );
+            self.cluster_bus_handle = Some(bus_handle);
+            self.cluster_bus_stop = Some(bus_stop);
+
+            // Start gossip timer (ping every 1 second)
+            let (gossip_handle, gossip_stop) = cluster_bus::start_gossip_timer(
+                self.db.clone(),
+                self.config.logger.clone(),
+                1000,
+            );
+            self.gossip_handle = Some(gossip_handle);
+            self.gossip_stop = Some(gossip_stop);
+        }
     }
 
     #[cfg(unix)]
@@ -710,6 +757,19 @@ impl Server {
         }
         if let Some(t) = &self.hz_stop {
             let _ = t.send(());
+        }
+        // Stop cluster bus and gossip timer
+        if let Some(stop) = &self.cluster_bus_stop {
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        if let Some(stop) = &self.gossip_stop {
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        // Save cluster config on shutdown
+        if self.config.cluster_enabled {
+            if let Ok(shard) = self.db.shard_write(0, 0) {
+                let _ = database::cluster::save_cluster_config(&shard.db.cluster, &shard.db.cluster.config_file.clone());
+            }
         }
         self.join();
     }
